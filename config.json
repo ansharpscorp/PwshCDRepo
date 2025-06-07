@@ -1,0 +1,13 @@
+{
+  "tenant_id": "<YOUR_TENANT_ID>",
+  "client_id": "<YOUR_CLIENT_ID>",
+  "client_secret": "<YOUR_CLIENT_SECRET>",
+  "output_dir": "output",
+  "log_file": "logs\download.log",
+  "progress_file": "logs\progress.csv",
+  "date": "2025-05-01",
+  "max_parallel_requests": 20,
+  "token_refresh_threshold_sec": 300,
+  "max_retry": 5,
+  "retry_backoff": [2, 4, 8, 16, 32]
+}
