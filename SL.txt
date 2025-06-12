@@ -1,21 +1,38 @@
-WITH ParticipantLevel AS (
+WITH UPNParticipants AS (
     SELECT
         [Date],
         [Conference Id],
-        [Second UPN],
+        [Second UPN] AS Participant,
         MAX([Audio Call Count]) AS AudioCallCountPerUser,
         MAX([Video Call Count]) AS VideoCallCountPerUser
     FROM YourTableName
+    WHERE [Second UPN] IS NOT NULL AND [Second UPN] <> ''
     GROUP BY [Date], [Conference Id], [Second UPN]
+),
+PhoneParticipants AS (
+    SELECT
+        [Date],
+        [Conference Id],
+        [Second Phone Number] AS Participant,
+        MAX([Audio Call Count]) AS AudioCallCountPerUser,
+        MAX([Video Call Count]) AS VideoCallCountPerUser
+    FROM YourTableName
+    WHERE [Second Phone Number] IS NOT NULL AND [Second Phone Number] <> ''
+    GROUP BY [Date], [Conference Id], [Second Phone Number]
+),
+AllParticipants AS (
+    SELECT * FROM UPNParticipants
+    UNION ALL
+    SELECT * FROM PhoneParticipants
 ),
 ConferenceSummary AS (
     SELECT
         [Date],
         [Conference Id],
-        COUNT(DISTINCT [Second UPN]) AS UniqueParticipants,
+        COUNT(DISTINCT Participant) AS UniqueParticipants,
         SUM(AudioCallCountPerUser) AS TotalAudioCalls,
         SUM(VideoCallCountPerUser) AS TotalVideoCalls
-    FROM ParticipantLevel
+    FROM AllParticipants
     GROUP BY [Date], [Conference Id]
 ),
 CategorizedConferences AS (
@@ -23,8 +40,8 @@ CategorizedConferences AS (
         [Date],
         CASE
             WHEN UniqueParticipants < 10 THEN '<10'
-            WHEN UniqueParticipants >= 10 AND UniqueParticipants <= 25 THEN '>10 and <=25'
-            WHEN UniqueParticipants > 25 AND UniqueParticipants <= 100 THEN '>25 and <=100'
+            WHEN UniqueParticipants BETWEEN 10 AND 25 THEN '>10 and <=25'
+            WHEN UniqueParticipants BETWEEN 26 AND 100 THEN '>25 and <=100'
             ELSE '>100'
         END AS ParticipantGroup,
         TotalAudioCalls,
