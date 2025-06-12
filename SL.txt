@@ -1,0 +1,32 @@
+WITH ConferenceSummary AS (
+    SELECT
+        [Date],
+        [Conference Id],
+        COUNT(DISTINCT [Second UPN]) AS UniqueParticipants,
+        SUM([Audio Call Count]) AS TotalAudioCalls,
+        SUM([Video Call Count]) AS TotalVideoCalls
+    FROM YourTableName
+    GROUP BY [Date], [Conference Id]
+),
+CategorizedConferences AS (
+    SELECT
+        [Date],
+        CASE
+            WHEN UniqueParticipants < 10 THEN '<10'
+            WHEN UniqueParticipants >= 10 AND UniqueParticipants <= 25 THEN '>10 and <=25'
+            WHEN UniqueParticipants > 25 AND UniqueParticipants <= 100 THEN '>25 and <=100'
+            ELSE '>100'
+        END AS ParticipantGroup,
+        TotalAudioCalls,
+        TotalVideoCalls
+    FROM ConferenceSummary
+)
+SELECT
+    [Date],
+    ParticipantGroup,
+    COUNT(DISTINCT [Conference Id]) AS TotalUniqueConferences,
+    SUM(TotalAudioCalls) AS TotalAudioCalls,
+    SUM(TotalVideoCalls) AS TotalVideoCalls
+FROM CategorizedConferences
+GROUP BY [Date], ParticipantGroup
+ORDER BY [Date], ParticipantGroup;
