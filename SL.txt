@@ -1,11 +1,21 @@
-WITH ConferenceSummary AS (
+WITH ParticipantLevel AS (
+    SELECT
+        [Date],
+        [Conference Id],
+        [Second UPN],
+        MAX([Audio Call Count]) AS AudioCallCountPerUser,
+        MAX([Video Call Count]) AS VideoCallCountPerUser
+    FROM YourTableName
+    GROUP BY [Date], [Conference Id], [Second UPN]
+),
+ConferenceSummary AS (
     SELECT
         [Date],
         [Conference Id],
         COUNT(DISTINCT [Second UPN]) AS UniqueParticipants,
-        SUM([Audio Call Count]) AS TotalAudioCalls,
-        SUM([Video Call Count]) AS TotalVideoCalls
-    FROM YourTableName
+        SUM(AudioCallCountPerUser) AS TotalAudioCalls,
+        SUM(VideoCallCountPerUser) AS TotalVideoCalls
+    FROM ParticipantLevel
     GROUP BY [Date], [Conference Id]
 ),
 CategorizedConferences AS (
