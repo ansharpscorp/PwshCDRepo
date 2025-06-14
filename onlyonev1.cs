@@ -64,37 +64,48 @@ namespace Models
 
 // Downloader/GraphHelper.cs
 using Microsoft.Identity.Client;
-using Models;
+using System;
+using System.Threading.Tasks;
 
 namespace Downloader
 {
     public static class GraphHelper
     {
-        private static IConfidentialClientApplication app;
-        private static AuthenticationResult result;
-        private static DateTime expiry;
-        private static readonly object tokenLock = new object();
+        private static string? _accessToken = null;
+        private static DateTime _expiry = DateTime.MinValue;
+        private static readonly object _lock = new();
 
-        public static string GetAccessToken(AppConfig config)
+        public static async Task<string> GetAccessTokenAsync()
         {
-            lock (tokenLock)
+            lock (_lock)
             {
-                if (result == null || expiry < DateTime.UtcNow)
+                if (!string.IsNullOrEmpty(_accessToken) && _expiry > DateTime.UtcNow.AddMinutes(5))
                 {
-                    app = ConfidentialClientApplicationBuilder
-                        .Create(config.ClientId)
-                        .WithClientSecret(config.ClientSecret)
-                        .WithTenantId(config.TenantId)
-                        .Build();
-
-                    result = app.AcquireTokenForClient(new[] { config.GraphScope }).ExecuteAsync().Result;
-                    expiry = DateTime.UtcNow.AddMinutes(50);
+                    return _accessToken;
                 }
-                return result.AccessToken;
             }
+
+            var app = ConfidentialClientApplicationBuilder
+                .Create(ConfigLoader.Config["GraphAPI:ClientId"])
+                .WithClientSecret(ConfigLoader.Config["GraphAPI:ClientSecret"])
+                .WithTenantId(ConfigLoader.Config["GraphAPI:TenantId"])
+                .Build();
+
+            var scopes = new[] { ConfigLoader.Config["GraphAPI:Scope"] };
+
+            var result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
+
+            lock (_lock)
+            {
+                _accessToken = result.AccessToken;
+                _expiry = DateTime.UtcNow.AddSeconds(result.ExpiresIn);
+            }
+
+            return _accessToken!;
         }
     }
 }
+
 
 // Downloader/Logger.cs
 namespace Downloader
@@ -115,82 +126,82 @@ namespace Downloader
 // Downloader/CallRecordDownloader.cs
 using Newtonsoft.Json.Linq;
 using Polly;
-using CsvHelper;
-using System.Globalization;
-using Models;
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Downloader;
 
 namespace Downloader
 {
-    public static class CallRecordDownloader
+    public class CallRecordDownloader
     {
-        public static async Task ProcessConferenceIdsAsync(AppConfig config, string date, string inputCsv)
+        private static readonly HttpClient _httpClient = new HttpClient();
+
+        public static async Task<JObject?> DownloadCallRecordAsync(string conferenceId)
         {
-            var ids = File.ReadAllLines(Path.Combine(config.CsvFolder, inputCsv)).Skip(1);
-            Directory.CreateDirectory(config.OutputFolder);
+            string token = await GraphHelper.GetAccessTokenAsync();
+            string baseUrl = $"{ConfigLoader.Config["GraphAPI:BaseUrl"]}/communications/callRecords/{conferenceId}";
 
-            var policy = Policy.Handle<Exception>()
-                .WaitAndRetryAsync(config.MaxRetry, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
+            // Main CallRecord data
+            JObject root = await GetApiDataAsync($"{baseUrl}", token);
 
-            await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = config.MaxParallel }, async (id, ct) =>
+            if (root == null)
             {
-                await policy.ExecuteAsync(async () =>
-                {
-                    string token = GraphHelper.GetAccessToken(config);
-                    var client = new HttpClient();
+                Logger.LogError($"Failed to fetch CallRecord for {conferenceId}");
+                return null;
+            }
 
-                    // Main CallRecord
-                    var url = $"https://graph.microsoft.com/v1.0/communications/callRecords/{id}";
-                    var mainResp = await client.GetStringAsync(url);
-                    JObject mainObj = JObject.Parse(mainResp);
+            // participants_v2 (paginated)
+            var participantsV2 = await GetPaginatedDataAsync($"{baseUrl}/participants_v2", token);
+            root["participants_v2"] = participantsV2 != null ? JArray.FromObject(participantsV2) : new JArray();
 
-                    // participants_v2 Pagination
-                    var participantsUrl = $"https://graph.microsoft.com/v1.0/communications/callRecords/{id}/participants_v2";
-                    var participants = await FetchPagedDataAsync(client, participantsUrl, token);
+            // sessions expanded by segments (paginated)
+            var sessions = await GetPaginatedDataAsync($"{baseUrl}/sessions?$expand=segments", token);
+            root["sessions"] = sessions != null ? JArray.FromObject(sessions) : new JArray();
 
-                    // sessions Pagination
-                    var sessionsUrl = $"https://graph.microsoft.com/v1.0/communications/callRecords/{id}/sessions?$expand=segments";
-                    var sessions = await FetchPagedDataAsync(client, sessionsUrl, token);
-
-                    // Build final JSON
-                    JObject output = new JObject
-                    {
-                        ["id"] = mainObj["id"],
-                        ["type"] = mainObj["type"],
-                        ["modalities"] = mainObj["modalities"],
-                        ["version"] = mainObj["version"],
-                        ["joinWebUrl"] = mainObj["joinWebUrl"],
-                        ["participants"] = mainObj["participants"],
-                        ["organizer"] = mainObj["organizer"],
-                        ["organizer_v2"] = mainObj["organizer_v2"],
-                        ["participants_v2"] = participants,
-                        ["sessions"] = sessions
-                    };
-
-                    string outPath = Path.Combine(config.OutputFolder, date, DateTime.Parse(date).ToString("yyyy/MMM/dd"));
-                    Directory.CreateDirectory(outPath);
-                    File.WriteAllText(Path.Combine(outPath, $"{id}.json"), output.ToString());
-                });
-            });
+            return root;
         }
 
-        private static async Task<JArray> FetchPagedDataAsync(HttpClient client, string url, string token)
+        private static async Task<JObject?> GetApiDataAsync(string url, string token)
         {
-            var result = new JArray();
+            return await Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(2 * retryAttempt))
+                .ExecuteAsync(async () =>
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+
+                    using var response = await _httpClient.SendAsync(request);
+                    response.EnsureSuccessStatusCode();
+
+                    var content = await response.Content.ReadAsStringAsync();
+                    return JObject.Parse(content);
+                });
+        }
+
+        private static async Task<JArray?> GetPaginatedDataAsync(string url, string token)
+        {
+            var allItems = new JArray();
+
             while (!string.IsNullOrEmpty(url))
             {
-                var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Add("Authorization", $"Bearer {token}");
-                var response = await client.SendAsync(request);
-                string content = await response.Content.ReadAsStringAsync();
-                var json = JObject.Parse(content);
-                if (json["value"] != null)
-                    result.Merge(json["value"]);
-                url = json["@odata.nextLink"]?.ToString();
+                var page = await GetApiDataAsync(url, token);
+
+                if (page?["value"] != null)
+                {
+                    allItems.Merge(page["value"]);
+                }
+
+                url = page?["@odata.nextLink"]?.ToString();
             }
-            return result;
+
+            return allItems;
         }
     }
 }
+
 
 // appsettings.json
 {
