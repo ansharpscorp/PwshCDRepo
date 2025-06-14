@@ -1,0 +1,195 @@
+// Teams CDR Downloader - Regenerated Full Solution (PowerShell Equivalent in C#)
+
+/* Project Structure:
+ * /Program.cs
+ * /ConfigLoader.cs
+ * /GraphHelper.cs
+ * /CallRecordDownloader.cs
+ * /Logger.cs
+ * /Models/CallRecord.cs (placeholder for future use)
+ * /appsettings.json
+ */
+
+// appsettings.json
+{
+  "GraphApi": {
+    "TenantId": "YOUR_TENANT_ID",
+    "ClientId": "YOUR_CLIENT_ID",
+    "ClientSecret": "YOUR_CLIENT_SECRET",
+    "Scope": "https://graph.microsoft.com/.default"
+  },
+  "Paths": {
+    "InputCsv": "./Input", 
+    "OutputJsonRoot": "./Output", 
+    "FailedCsv": "./Failed/FailedCalls.csv", 
+    "LogFilePath": "./Logs/log.txt"
+  },
+  "Throttling": {
+    "MaxParallelTasks": 4
+  },
+  "RetryPolicy": {
+    "MaxRetryCount": 3,
+    "RetryDelaySeconds": 5
+  }
+}
+
+// ConfigLoader.cs
+using Microsoft.Extensions.Configuration;
+public class ConfigLoader
+{
+    public IConfigurationRoot Config { get; private set; }
+    public ConfigLoader()
+    {
+        Config = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json")
+            .Build();
+    }
+}
+
+// Logger.cs
+public class Logger
+{
+    private readonly string LogPath;
+    private readonly object lockObj = new object();
+
+    public Logger(string logPath)
+    {
+        LogPath = logPath ?? throw new ArgumentNullException(nameof(logPath));
+        Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+    }
+    public void LogInfo(string message) => Log($"INFO: {message}");
+    public void LogError(string message) => Log($"ERROR: {message}");
+
+    private void Log(string message)
+    {
+        lock (lockObj)
+        {
+            File.AppendAllText(LogPath, $"{DateTime.UtcNow:u} {message}\n");
+        }
+    }
+}
+
+// GraphHelper.cs
+using Newtonsoft.Json.Linq;
+using System.Net.Http.Headers;
+public class GraphHelper
+{
+    private static string? AccessToken;
+    private static DateTime TokenExpiry = DateTime.MinValue;
+    private static readonly object tokenLock = new();
+
+    public static async Task<string> GetAccessTokenAsync(IConfiguration config)
+    {
+        lock (tokenLock)
+        {
+            if (AccessToken != null && DateTime.UtcNow < TokenExpiry)
+                return AccessToken;
+        }
+
+        using var client = new HttpClient();
+        var dict = new Dictionary<string, string>
+        {
+            ["client_id"] = config["GraphApi:ClientId"],
+            ["scope"] = config["GraphApi:Scope"],
+            ["client_secret"] = config["GraphApi:ClientSecret"],
+            ["grant_type"] = "client_credentials"
+        };
+
+        var response = await client.PostAsync(
+            $"https://login.microsoftonline.com/{config["GraphApi:TenantId"]}/oauth2/v2.0/token",
+            new FormUrlEncodedContent(dict));
+
+        var tokenJson = JObject.Parse(await response.Content.ReadAsStringAsync());
+        lock (tokenLock)
+        {
+            AccessToken = tokenJson["access_token"]?.ToString();
+            TokenExpiry = DateTime.UtcNow.AddMinutes(50);
+            return AccessToken;
+        }
+    }
+
+    public static async Task<JObject?> FetchCallRecordAsync(string callId, IConfiguration config)
+    {
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", await GetAccessTokenAsync(config));
+
+        string url = $"https://graph.microsoft.com/v1.0/communications/callRecords/{callId}?$expand=sessions($expand=segments)";
+        var res = await client.GetStringAsync(url);
+        return JObject.Parse(res);
+    }
+
+    public static async Task<List<JObject>> FetchParticipantsV2Async(string callId, IConfiguration config)
+    {
+        var data = new List<JObject>();
+        string? url = $"https://graph.microsoft.com/v1.0/communications/callRecords/{callId}/participants_v2";
+
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", await GetAccessTokenAsync(config));
+
+        do
+        {
+            var res = await client.GetStringAsync(url);
+            var root = JObject.Parse(res);
+            if (root["value"] != null)
+                data.AddRange(root["value"]?.ToObject<List<JObject>>() ?? new List<JObject>());
+            url = root["@odata.nextLink"]?.ToString();
+        } while (!string.IsNullOrEmpty(url));
+
+        return data;
+    }
+}
+
+// CallRecordDownloader.cs
+using Newtonsoft.Json.Linq;
+public class CallRecordDownloader
+{
+    private readonly IConfiguration config;
+    private readonly Logger logger;
+
+    public CallRecordDownloader(IConfiguration config, Logger logger)
+    {
+        this.config = config;
+        this.logger = logger;
+    }
+
+    public async Task ProcessCallIdAsync(string callId)
+    {
+        try
+        {
+            var callJson = await GraphHelper.FetchCallRecordAsync(callId, config);
+            if (callJson == null) return;
+
+            var participantsV2 = await GraphHelper.FetchParticipantsV2Async(callId, config);
+            callJson["participants_v2"] = JArray.FromObject(participantsV2);
+
+            string startDateTime = callJson["startDateTime"]?.ToString() ?? DateTime.UtcNow.ToString("s");
+            DateTime callDate = DateTime.Parse(startDateTime);
+            string path = Path.Combine(config["Paths:OutputJsonRoot"], callDate.ToString("yyyy"), callDate.ToString("MM"), callDate.ToString("dd"));
+            Directory.CreateDirectory(path);
+
+            string outputFile = Path.Combine(path, $"{callId}.json");
+            await File.WriteAllTextAsync(outputFile, callJson.ToString());
+
+            logger.LogInfo($"Saved CallRecord {callId} to {outputFile}");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError($"Failed {callId}: {ex.Message}");
+            await File.AppendAllTextAsync(config["Paths:FailedCsv"], $"{callId}\n");
+        }
+    }
+}
+
+// Program.cs
+var configLoader = new ConfigLoader();
+var config = configLoader.Config;
+var logger = new Logger(config["Paths:LogFilePath"]);
+var downloader = new CallRecordDownloader(config, logger);
+
+string dateArg = args[0];
+string csvFile = args[1];
+var callIds = File.ReadAllLines(csvFile);
+
+Parallel.ForEach(callIds, new ParallelOptions { MaxDegreeOfParallelism = int.Parse(config["Throttling:MaxParallelTasks"]) },
+    async callId => await downloader.ProcessCallIdAsync(callId.Trim()));
