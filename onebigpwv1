@@ -1,0 +1,174 @@
+# GraphCDRDownloader Project
+
+# 1. Config.json
+@"
+{
+  "TenantId": "<Your-Tenant-ID>",
+  "ClientId": "<Your-Client-ID>",
+  "ClientSecret": "<Your-Client-Secret>",
+  "Scope": "https://graph.microsoft.com/.default",
+  "BaseGraphUrl": "https://graph.microsoft.com/v1.0",
+  "OutputFolder": "C:\\CDR\\Output",
+  "FailedCsv": "C:\\CDR\\Failed.csv",
+  "LogFile": "C:\\CDR\\Downloader.log",
+  "TokenExpiryBufferSeconds": 300,
+  "BatchSize": 5000
+}
+"@ | Out-File -FilePath "Config.json" -Encoding utf8
+
+
+# 2. GraphHelper.psm1
+@"
+$script:Token = $null
+$script:TokenExpiry = [datetime]::MinValue
+
+function Get-Config { (Get-Content "Config.json" | ConvertFrom-Json) }
+
+function Get-AccessToken {
+    $config = Get-Config
+    if ($script:Token -and ($script:TokenExpiry -gt (Get-Date).AddSeconds($config.TokenExpiryBufferSeconds))) {
+        return $script:Token
+    }
+    $body = @{
+        client_id     = $config.ClientId
+        scope         = $config.Scope
+        client_secret = $config.ClientSecret
+        grant_type    = "client_credentials"
+    }
+    $resp = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($config.TenantId)/oauth2/v2.0/token" -Body $body
+    $script:Token = $resp.access_token
+    $script:TokenExpiry = (Get-Date).AddSeconds($resp.expires_in)
+    return $script:Token
+}
+
+function Invoke-GraphGetWithRetry {
+    param ([string]$Url)
+    $maxRetries = 5
+    $retryDelay = 5
+    for ($i = 0; $i -lt $maxRetries; $i++) {
+        try {
+            $token = Get-AccessToken
+            $headers = @{ Authorization = "Bearer $token" }
+            return Invoke-RestMethod -Uri $Url -Headers $headers -Method Get -TimeoutSec 60
+        } catch {
+            if ($_.Exception.Message -match '429|timeout') {
+                Start-Sleep -Seconds ($retryDelay * ($i + 1))
+            } else { throw $_ }
+        }
+    }
+    throw "Max retries reached for $Url"
+}
+
+function Get-AllPages {
+    param ([string]$Url)
+    $result = @()
+    do {
+        $response = Invoke-GraphGetWithRetry -Url $Url
+        $result += $response.value
+        $Url = $response.'@odata.nextLink'
+    } while ($Url)
+    return $result
+}
+"@ | Out-File -FilePath "GraphHelper.psm1" -Encoding utf8
+
+
+# 3. Logger.psm1
+@"
+$logLock = New-Object Object
+$csvLock = New-Object Object
+
+function Write-Log {
+    param([string]$Message)
+    $config = Get-Config
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp - $Message"
+    [System.Threading.Monitor]::Enter($logLock)
+    try {
+        Add-Content -Path $config.LogFile -Value $line
+    } finally {
+        [System.Threading.Monitor]::Exit($logLock)
+    }
+}
+
+function Write-FailedCsv {
+    param([string]$ConferenceId)
+    $config = Get-Config
+    [System.Threading.Monitor]::Enter($csvLock)
+    try {
+        "$ConferenceId" | Out-File -Append -FilePath $config.FailedCsv -Encoding utf8
+    } finally {
+        [System.Threading.Monitor]::Exit($csvLock)
+    }
+}
+"@ | Out-File -FilePath "Logger.psm1" -Encoding utf8
+
+
+# 4. Processor.psm1
+@"
+Import-Module .\GraphHelper.psm1
+Import-Module .\Logger.psm1
+
+function Process-ConferenceId {
+    param([string]$ConferenceId)
+
+    $config = Get-Config
+    $baseUrl = "$($config.BaseGraphUrl)/communications/callRecords/$ConferenceId"
+
+    try {
+        $mainData = Invoke-GraphGetWithRetry -Url $baseUrl
+        $participants = Get-AllPages -Url "$baseUrl/participants_v2"
+        $sessions = Get-AllPages -Url "$baseUrl/sessions"
+
+        $combined = [PSCustomObject]@{
+            id            = $mainData.id
+            type          = $mainData.type
+            version       = $mainData.version
+            modalities    = $mainData.modalities
+            participants  = $participants
+            sessions      = $sessions
+        }
+
+        $outputFile = Join-Path $config.OutputFolder "$($mainData.id).json"
+        $newJson = $combined | ConvertTo-Json -Depth 10
+
+        if (Test-Path $outputFile) {
+            $oldSize = (Get-Item $outputFile).Length
+            $newSize = [System.Text.Encoding]::UTF8.GetByteCount($newJson)
+            if ($newSize -gt $oldSize) {
+                $newJson | Out-File -FilePath $outputFile -Encoding utf8
+            }
+        } else {
+            $newJson | Out-File -FilePath $outputFile -Encoding utf8
+        }
+        Write-Log "Processed: $ConferenceId"
+    }
+    catch {
+        Write-FailedCsv -ConferenceId $ConferenceId
+        Write-Log "Failed: $ConferenceId - $_"
+    }
+}
+"@ | Out-File -FilePath "Processor.psm1" -Encoding utf8
+
+
+# 5. RunDownloader.ps1
+@"
+Import-Module .\GraphHelper.psm1
+Import-Module .\Processor.psm1
+Import-Module .\Logger.psm1
+
+$config = Get-Config
+$conferenceIds = Import-Csv "abc.csv" | Select-Object -ExpandProperty ConferenceId
+
+$batchSize = $config.BatchSize
+$throttleLimit = [Environment]::ProcessorCount
+
+for ($i = 0; $i -lt $conferenceIds.Count; $i += $batchSize) {
+    $chunk = $conferenceIds[$i..([Math]::Min($i + $batchSize - 1, $conferenceIds.Count - 1))]
+    $chunk | ForEach-Object -Parallel {
+        Import-Module "C:\\Path\\To\\GraphHelper.psm1"
+        Import-Module "C:\\Path\\To\\Processor.psm1"
+        Import-Module "C:\\Path\\To\\Logger.psm1"
+        Process-ConferenceId -ConferenceId $_
+    } -ThrottleLimit $throttleLimit
+}
+"@ | Out-File -FilePath "RunDownloader.ps1" -Encoding utf8
