@@ -76,40 +76,49 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using TeamsCDRDownloader.Helpers;
+using Microsoft.Extensions.Configuration;
+using System.Collections.Generic;
 
 namespace TeamsCDRDownloader.Downloader
 {
-    public static class GraphHelper
+    public class GraphHelper
     {
-        private static string accessToken;
-        private static DateTimeOffset expiry;
-
-        public static async Task<string> GetAccessTokenAsync()
+        private string AccessToken = string.Empty; // Fixed: initialized to empty string
+        private DateTime ExpiryTime;
+        private readonly string ClientId;
+        private readonly string TenantId;
+        private readonly string ClientSecret;
+        private readonly string Scope;
+    
+        public GraphHelper(IConfiguration config)
         {
-            if (string.IsNullOrEmpty(accessToken) || DateTimeOffset.UtcNow >= expiry)
-            {
-                var app = ConfidentialClientApplicationBuilder.Create(ConfigLoader.Config["GraphAPI:ClientId"])
-                    .WithClientSecret(ConfigLoader.Config["GraphAPI:ClientSecret"])
-                    .WithTenantId(ConfigLoader.Config["GraphAPI:TenantId"])
-                    .Build();
-
-                var result = await app.AcquireTokenForClient(new[] { ConfigLoader.Config["GraphAPI:Scope"] }).ExecuteAsync();
-                accessToken = result.AccessToken;
-                expiry = result.ExpiresOn;
-            }
-            return accessToken;
+            ClientId = config["GraphAPI:ClientId"] ?? throw new ArgumentNullException("GraphAPI:ClientId");
+            TenantId = config["GraphAPI:TenantId"] ?? throw new ArgumentNullException("GraphAPI:TenantId");
+            ClientSecret = config["GraphAPI:ClientSecret"] ?? throw new ArgumentNullException("GraphAPI:ClientSecret");
+            Scope = config["GraphAPI:Scope"] ?? throw new ArgumentNullException("GraphAPI:Scope");
+            AccessToken = string.Empty; // Initialized here
+            ExpiryTime = DateTime.UtcNow.AddMinutes(-5);
         }
-
-        public static async Task<string> GetGraphDataAsync(string url)
+    
+        public async Task<string> GetAccessTokenAsync()
         {
-            using var httpClient = new HttpClient();
-            var token = await GetAccessTokenAsync();
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var response = await httpClient.GetAsync(url);
-            return await response.Content.ReadAsStringAsync();
+            if (DateTime.UtcNow >= ExpiryTime)
+            {
+                var app = ConfidentialClientApplicationBuilder
+                            .Create(ClientId)
+                            .WithTenantId(TenantId)
+                            .WithClientSecret(ClientSecret)
+                            .Build();
+    
+                var result = await app.AcquireTokenForClient(new[] { Scope }).ExecuteAsync();
+                AccessToken = result.AccessToken;
+                ExpiryTime = DateTime.UtcNow.AddMinutes(50);
+            }
+    
+            return AccessToken;
         }
     }
+
 }
 
 --- Downloader/CallRecordDownloader.cs ---
@@ -193,29 +202,30 @@ namespace TeamsCDRDownloader.Helpers
 
 using System;
 using System.IO;
+using System.Threading;
 
 namespace TeamsCDRDownloader.Helpers
 {
-    public static class Logger
+   public class Logger
     {
-        private static string logPath;
+        private readonly string LogPath = string.Empty; // Fixed initialization
+        private readonly object _lock = new object();
 
-        public static void Init()
+        public Logger(string logPath)
         {
-            logPath = Path.Combine("Logs", $"log_{DateTime.UtcNow:yyyyMMdd}.txt");
-            Directory.CreateDirectory("Logs");
+            LogPath = logPath ?? throw new ArgumentNullException(nameof(logPath));
         }
 
-        public static void LogInfo(string message)
+        public void Log(string message)
         {
-            File.AppendAllText(logPath, $"INFO: {DateTime.UtcNow}: {message}{Environment.NewLine}");
-        }
-
-        public static void LogError(string message)
-        {
-            File.AppendAllText(logPath, $"ERROR: {DateTime.UtcNow}: {message}{Environment.NewLine}");
+            lock (_lock)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!); // Ensure folder exists
+                File.AppendAllText(LogPath, $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} : {message}{Environment.NewLine}");
+            }
         }
     }
+
 }
 
 --- appsettings.json ---
