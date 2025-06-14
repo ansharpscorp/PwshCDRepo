@@ -3,230 +3,253 @@ TeamsCDRDownloader/
 ├── Program.cs
 ├── Downloader
 │   ├── CallRecordDownloader.cs
-│   ├── GraphHelper.cs
-│   ├── Logger.cs
-│   └── ConfigLoader.cs
-├── Models
-│   └── AppConfig.cs
+│   ├── ConferenceIdReader.cs
+│   └── GraphHelper.cs
+├── Helpers
+│   ├── ConfigLoader.cs
+│   └── Logger.cs
 ├── appsettings.json
 ├── TeamsCDRDownloader.csproj
 └── README.md
 
-// Program.cs
-using Downloader;
-using Models;
+--- Program.cs ---
 
-class Program
+using System;
+using System.Threading.Tasks;
+using TeamsCDRDownloader.Downloader;
+using TeamsCDRDownloader.Helpers;
+
+namespace TeamsCDRDownloader
 {
-    static async Task Main(string[] args)
+    internal class Program
     {
-        var config = ConfigLoader.Load();
-        var inputCsvPath = args[1];
-        var startDate = args[0];
-        await CallRecordDownloader.ProcessConferenceIdsAsync(config, startDate, inputCsvPath);
-    }
-}
-
-// Downloader/ConfigLoader.cs
-using Microsoft.Extensions.Configuration;
-using Models;
-
-namespace Downloader
-{
-    public static class ConfigLoader
-    {
-        public static AppConfig Load()
+        static async Task Main(string[] args)
         {
-            IConfiguration config = new ConfigurationBuilder()
-                .AddJsonFile("appsettings.json")
-                .Build();
-            return config.Get<AppConfig>();
+            if (args.Length != 2)
+            {
+                Console.WriteLine("Usage: TeamsCDRDownloader <Date> <ConferenceIdCsvFilePath>");
+                return;
+            }
+
+            string date = args[0];
+            string csvPath = args[1];
+
+            Logger.Init();
+            Logger.LogInfo($"Starting download for date: {date}");
+
+            var callRecords = ConferenceIdReader.ReadConferenceIds(csvPath);
+            var downloader = new CallRecordDownloader();
+            await downloader.ProcessCallRecordsAsync(callRecords, date);
+
+            Logger.LogInfo("Download process completed.");
         }
     }
 }
 
-// Models/AppConfig.cs
-namespace Models
+--- Downloader/ConferenceIdReader.cs ---
+
+using System.Collections.Generic;
+using System.IO;
+
+namespace TeamsCDRDownloader.Downloader
 {
-    public class AppConfig
+    public static class ConferenceIdReader
     {
-        public string TenantId { get; set; }
-        public string ClientId { get; set; }
-        public string ClientSecret { get; set; }
-        public string GraphScope { get; set; }
-        public string CsvFolder { get; set; }
-        public string OutputFolder { get; set; }
-        public string LogFile { get; set; }
-        public int MaxRetry { get; set; }
-        public int MaxParallel { get; set; }
+        public static List<string> ReadConferenceIds(string csvPath)
+        {
+            var ids = new List<string>();
+            foreach (var line in File.ReadLines(csvPath))
+            {
+                if (!line.Contains("ConferenceId"))
+                    ids.Add(line.Trim());
+            }
+            return ids;
+        }
     }
 }
 
-// Downloader/GraphHelper.cs
+--- Downloader/GraphHelper.cs ---
+
 using Microsoft.Identity.Client;
 using System;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading.Tasks;
+using TeamsCDRDownloader.Helpers;
 
-namespace Downloader
+namespace TeamsCDRDownloader.Downloader
 {
     public static class GraphHelper
     {
-        private static string? _accessToken = null;
-        private static DateTime _expiry = DateTime.MinValue;
-        private static readonly object _lock = new();
+        private static string accessToken;
+        private static DateTimeOffset expiry;
 
         public static async Task<string> GetAccessTokenAsync()
         {
-            lock (_lock)
+            if (string.IsNullOrEmpty(accessToken) || DateTimeOffset.UtcNow >= expiry)
             {
-                if (!string.IsNullOrEmpty(_accessToken) && _expiry > DateTime.UtcNow.AddMinutes(5))
-                {
-                    return _accessToken;
-                }
+                var app = ConfidentialClientApplicationBuilder.Create(ConfigLoader.Config["GraphAPI:ClientId"])
+                    .WithClientSecret(ConfigLoader.Config["GraphAPI:ClientSecret"])
+                    .WithTenantId(ConfigLoader.Config["GraphAPI:TenantId"])
+                    .Build();
+
+                var result = await app.AcquireTokenForClient(new[] { ConfigLoader.Config["GraphAPI:Scope"] }).ExecuteAsync();
+                accessToken = result.AccessToken;
+                expiry = result.ExpiresOn;
             }
-
-            var app = ConfidentialClientApplicationBuilder
-                .Create(ConfigLoader.Config["GraphAPI:ClientId"])
-                .WithClientSecret(ConfigLoader.Config["GraphAPI:ClientSecret"])
-                .WithTenantId(ConfigLoader.Config["GraphAPI:TenantId"])
-                .Build();
-
-            var scopes = new[] { ConfigLoader.Config["GraphAPI:Scope"] };
-
-            var result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
-
-            lock (_lock)
-            {
-                _accessToken = result.AccessToken;
-                _expiry = DateTime.UtcNow.AddSeconds(result.ExpiresIn);
-            }
-
-            return _accessToken!;
+            return accessToken;
         }
-    }
-}
 
-
-// Downloader/Logger.cs
-namespace Downloader
-{
-    public static class Logger
-    {
-        private static readonly object logLock = new object();
-        public static void Log(string message, string logPath)
+        public static async Task<string> GetGraphDataAsync(string url)
         {
-            lock (logLock)
-            {
-                File.AppendAllText(logPath, $"{DateTime.Now}: {message}\n");
-            }
+            using var httpClient = new HttpClient();
+            var token = await GetAccessTokenAsync();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            var response = await httpClient.GetAsync(url);
+            return await response.Content.ReadAsStringAsync();
         }
     }
 }
 
-// Downloader/CallRecordDownloader.cs
-using Newtonsoft.Json.Linq;
-using Polly;
-using System;
-using System.IO;
-using System.Net.Http;
-using System.Threading.Tasks;
-using Downloader;
+--- Downloader/CallRecordDownloader.cs ---
 
-namespace Downloader
+using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+using TeamsCDRDownloader.Helpers;
+
+namespace TeamsCDRDownloader.Downloader
 {
     public class CallRecordDownloader
     {
-        private static readonly HttpClient _httpClient = new HttpClient();
-
-        public static async Task<JObject?> DownloadCallRecordAsync(string conferenceId)
+        public async Task ProcessCallRecordsAsync(List<string> conferenceIds, string date)
         {
-            string token = await GraphHelper.GetAccessTokenAsync();
-            string baseUrl = $"{ConfigLoader.Config["GraphAPI:BaseUrl"]}/communications/callRecords/{conferenceId}";
-
-            // Main CallRecord data
-            JObject root = await GetApiDataAsync($"{baseUrl}", token);
-
-            if (root == null)
+            foreach (var id in conferenceIds)
             {
-                Logger.LogError($"Failed to fetch CallRecord for {conferenceId}");
-                return null;
-            }
-
-            // participants_v2 (paginated)
-            var participantsV2 = await GetPaginatedDataAsync($"{baseUrl}/participants_v2", token);
-            root["participants_v2"] = participantsV2 != null ? JArray.FromObject(participantsV2) : new JArray();
-
-            // sessions expanded by segments (paginated)
-            var sessions = await GetPaginatedDataAsync($"{baseUrl}/sessions?$expand=segments", token);
-            root["sessions"] = sessions != null ? JArray.FromObject(sessions) : new JArray();
-
-            return root;
-        }
-
-        private static async Task<JObject?> GetApiDataAsync(string url, string token)
-        {
-            return await Policy
-                .Handle<Exception>()
-                .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(2 * retryAttempt))
-                .ExecuteAsync(async () =>
+                try
                 {
-                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                    string baseUrl = $"https://graph.microsoft.com/v1.0/communications/callRecords/{id}";
+                    string mainData = await GraphHelper.GetGraphDataAsync(baseUrl);
 
-                    using var response = await _httpClient.SendAsync(request);
-                    response.EnsureSuccessStatusCode();
+                    var root = JObject.Parse(mainData);
+                    root["participants_v2"] = await GetExpandedDataAsync($"{baseUrl}/participants_v2");
+                    root["sessions"] = await GetExpandedDataAsync($"{baseUrl}/sessions?$expand=segments");
 
-                    var content = await response.Content.ReadAsStringAsync();
-                    return JObject.Parse(content);
-                });
-        }
-
-        private static async Task<JArray?> GetPaginatedDataAsync(string url, string token)
-        {
-            var allItems = new JArray();
-
-            while (!string.IsNullOrEmpty(url))
-            {
-                var page = await GetApiDataAsync(url, token);
-
-                if (page?["value"] != null)
-                {
-                    allItems.Merge(page["value"]);
+                    string outputDir = Path.Combine("Output", DateTime.Parse(date).ToString("yyyy/MMM/dd"));
+                    Directory.CreateDirectory(outputDir);
+                    string filePath = Path.Combine(outputDir, $"{id}.json");
+                    await File.WriteAllTextAsync(filePath, root.ToString());
                 }
-
-                url = page?["@odata.nextLink"]?.ToString();
+                catch (Exception ex)
+                {
+                    Logger.LogError($"Error processing {id}: {ex.Message}");
+                }
             }
+        }
 
-            return allItems;
+        private async Task<JArray> GetExpandedDataAsync(string url)
+        {
+            var data = new JArray();
+            do
+            {
+                var result = await GraphHelper.GetGraphDataAsync(url);
+                var root = JObject.Parse(result);
+                if (root["value"] != null)
+                    data.Merge(root["value"]);
+                url = root["@odata.nextLink"]?.ToString();
+            } while (!string.IsNullOrEmpty(url));
+
+            return data;
         }
     }
 }
 
+--- Helpers/ConfigLoader.cs ---
 
-// appsettings.json
+using Microsoft.Extensions.Configuration;
+using System.IO;
+
+namespace TeamsCDRDownloader.Helpers
 {
-  "TenantId": "<tenant>",
-  "ClientId": "<client>",
-  "ClientSecret": "<secret>",
-  "GraphScope": "https://graph.microsoft.com/.default",
-  "CsvFolder": "./CSV",
-  "OutputFolder": "./Output",
-  "LogFile": "./log.txt",
-  "MaxRetry": 3,
-  "MaxParallel": 4
+    public static class ConfigLoader
+    {
+        public static IConfigurationRoot Config { get; private set; }
+
+        static ConfigLoader()
+        {
+            var builder = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+
+            Config = builder.Build();
+        }
+    }
 }
 
-// TeamsCDRDownloader.csproj
+--- Helpers/Logger.cs ---
+
+using System;
+using System.IO;
+
+namespace TeamsCDRDownloader.Helpers
+{
+    public static class Logger
+    {
+        private static string logPath;
+
+        public static void Init()
+        {
+            logPath = Path.Combine("Logs", $"log_{DateTime.UtcNow:yyyyMMdd}.txt");
+            Directory.CreateDirectory("Logs");
+        }
+
+        public static void LogInfo(string message)
+        {
+            File.AppendAllText(logPath, $"INFO: {DateTime.UtcNow}: {message}{Environment.NewLine}");
+        }
+
+        public static void LogError(string message)
+        {
+            File.AppendAllText(logPath, $"ERROR: {DateTime.UtcNow}: {message}{Environment.NewLine}");
+        }
+    }
+}
+
+--- appsettings.json ---
+
+{
+  "GraphAPI": {
+    "ClientId": "your-client-id",
+    "TenantId": "your-tenant-id",
+    "ClientSecret": "your-client-secret",
+    "Scope": "https://graph.microsoft.com/.default"
+  }
+}
+
+--- TeamsCDRDownloader.csproj ---
+
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net6.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Identity.Client" Version="4.54.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="6.0.0" />
-    <PackageReference Include="CsvHelper" Version="30.0.1" />
-    <PackageReference Include="Polly" Version="7.2.3" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.54.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>
+
+--- README.md ---
+
+# Teams CDR Downloader
+
+## Usage:
+```
+dotnet run -- 2025-05-31 "C:\\Input\\ConfId_20250531.csv"
+```
+
+--- END ---
