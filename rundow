@@ -1,0 +1,76 @@
+param (
+    [string]$InputCsv = "C:\Default\Input.csv",
+    [string]$Date = (Get-Date -Format 'yyyy-MM-dd')  # Defaults to today if not supplied
+)
+
+# Validate and format Date parameter
+try {
+    $DateSuffix = (Get-Date $Date).ToString("yyyyMMdd")
+} catch {
+    Write-Error "Invalid Date format. Please provide Date as 'yyyy-MM-dd'. Example: 2025-06-14"
+    exit 1
+}
+
+# Set output and log paths using DateSuffix
+$OutputFolder = "C:\Output\JsonFiles"
+$FailedCsvPath = "C:\Logs\Failed_$DateSuffix.csv"
+$LogFilePath = "C:\Logs\Downloader_$DateSuffix.log"
+
+# Throttle limit based on environment
+$ThrottleLimit = [Environment]::ProcessorCount * 2
+
+# Collect list of processed ConferenceIds
+Write-Output "[Info] Collecting already processed files..." | Out-File $LogFilePath -Append
+$ProcessedIds = @()
+if (Test-Path $OutputFolder) {
+    $ProcessedIds = Get-ChildItem -Path $OutputFolder -Filter "*.json" -Recurse | 
+                    Select-Object -ExpandProperty Name | 
+                    ForEach-Object { $_ -replace "\.json$", "" }
+}
+
+Write-Output "[Info] Already processed files found: $($ProcessedIds.Count)" | Out-File $LogFilePath -Append
+
+# Load Conference IDs from CSV
+$AllConferenceIds = Import-Csv $InputCsv | Select-Object -ExpandProperty ConferenceId
+
+# Filter out processed IDs
+$PendingConferenceIds = $AllConferenceIds | Where-Object { $_ -notin $ProcessedIds }
+
+Write-Output "[Info] Total IDs in CSV: $($AllConferenceIds.Count)" | Out-File $LogFilePath -Append
+Write-Output "[Info] Pending IDs to process: $($PendingConferenceIds.Count)" | Out-File $LogFilePath -Append
+
+# Thread-safe containers
+$syncFailed = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+$syncLog = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+# Begin parallel processing
+$PendingConferenceIds | ForEach-Object -Parallel {
+    param($OutputFolder, $syncFailed, $syncLog)
+
+    Import-Module "C:\Modules\GraphHelper.psm1"
+    Import-Module "C:\Modules\Processor.psm1"
+    Import-Module "C:\Modules\Logger.psm1"
+
+    try {
+        Process-ConfrerenceId $_
+        $syncLog.Add("Successfully processed ConferenceID: $_")
+    } 
+    catch {
+        $syncFailed.Add([PSCustomObject]@{
+            ConferenceId = $_
+            ErrorMessage = $_.Exception.Message
+        })
+        $syncLog.Add("Failed ConferenceID: $_ with error: $($_.Exception.Message)")
+    }
+} -ArgumentList $OutputFolder, $syncFailed, $syncLog -ThrottleLimit $ThrottleLimit
+
+# Export failures if any
+if ($syncFailed.Count -gt 0) {
+    $syncFailed | Export-Csv -Path $FailedCsvPath -NoTypeInformation -Force
+    Write-Output "[Info] Failed IDs logged to $FailedCsvPath" | Out-File $LogFilePath -Append
+}
+
+# Write process logs
+$syncLog | Out-File $LogFilePath -Append
+
+Write-Output "[Info] Run completed. Logs written to $LogFilePath" | Out-File $LogFilePath -Append
