@@ -1,0 +1,83 @@
+param (
+    [string]$StartDate = (Get-Date -Format 'yyyy-MM-dd'),
+    [int]$StartHour = 0,
+    [int]$EndHour = 23
+)
+
+# Import your existing module
+Import-Module "C:\Modules\GraphHelper.psm1"
+
+# Prepare output file with proper naming
+$DateSuffix = (Get-Date $StartDate).ToString("yyyyMMdd")
+$OutputCsv = "C:\Output\ConfId_${DateSuffix}_${StartHour}_${EndHour}.csv"
+
+# Write CSV header
+"ConferenceId" | Out-File -FilePath $OutputCsv -Encoding utf8 -Force
+
+# Calculate all 15-min interval start times
+$StartTime = [datetime]::ParseExact("$StartDate $StartHour`:00:00", "yyyy-MM-dd H`:mm`:ss", $null)
+$EndTime = [datetime]::ParseExact("$StartDate $EndHour`:59:59", "yyyy-MM-dd H`:mm`:ss", $null)
+
+$Intervals = @()
+while ($StartTime -lt $EndTime) {
+    $Intervals += $StartTime
+    $StartTime = $StartTime.AddMinutes(15)
+}
+
+# Create thread-safe collection for results
+$SyncHash = [hashtable]::Synchronized(@{ ConferenceIds = @() })
+
+# Throttle limit
+$ThrottleLimit = [Environment]::ProcessorCount * 2
+
+# Process each interval in parallel
+$Intervals | ForEach-Object -Parallel {
+    param($SyncHash)
+
+    Import-Module "C:\Modules\GraphHelper.psm1"
+
+    $IntervalStart = $_.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $IntervalEnd = $_.AddMinutes(15).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $MaxRetries = 5
+    $RetryCount = 0
+    $Success = $false
+
+    while (-not $Success -and $RetryCount -lt $MaxRetries) {
+        try {
+            $AccessToken = Get-AccessToken
+
+            $GraphUrl = "https://graph.microsoft.com/beta/communications/callRecords?`$filter=startDateTime ge $IntervalStart and startDateTime lt $IntervalEnd"
+            $ConferenceIds = @()
+
+            do {
+                $Response = Invoke-RestMethod -Uri $GraphUrl -Headers @{ Authorization = "Bearer $AccessToken" } -Method Get -ErrorAction Stop
+                if ($Response.value) {
+                    $ConferenceIds += $Response.value | ForEach-Object { $_.id }
+                }
+                $GraphUrl = $Response.'@odata.nextLink'
+            } while ($GraphUrl)
+
+            # Add results to thread-safe hashtable
+            $SyncHash.ConferenceIds += $ConferenceIds
+            $Success = $true
+        }
+        catch {
+            if ($_.Exception.Message -like "*429*" -or $_.Exception.Message -like "*timeout*") {
+                Start-Sleep -Seconds (5 * ($RetryCount + 1))
+                $RetryCount++
+            } else {
+                Write-Host "Non-retryable error for interval $IntervalStart : $($_.Exception.Message)"
+                $Success = $true # exit on non-retryable error
+            }
+        }
+    }
+} -ArgumentList $SyncHash -ThrottleLimit $ThrottleLimit
+
+# After all intervals processed, write unique ConferenceIds to CSV
+$UniqueIds = $SyncHash.ConferenceIds | Sort-Object -Unique
+$UniqueIds | ForEach-Object {
+    $_ | Out-File -FilePath $OutputCsv -Append -Encoding utf8
+}
+
+Write-Host "Conference IDs written to $OutputCsv"
