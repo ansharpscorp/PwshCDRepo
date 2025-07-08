@@ -1,0 +1,194 @@
+$global:StorageContext = $null
+$global:StorageContextCreated = $null
+
+function Get-ValidStorageContext {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$StorageAccountName
+    )
+
+    $now = Get-Date
+    if ($global:StorageContext -and $global:StorageContextCreated -gt $now.AddMinutes(-55)) {
+        return $global:StorageContext
+    }
+
+    try {
+        $secureSecret = $ClientSecret | ConvertTo-SecureString -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential ($ClientId, $secureSecret)
+        Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $credential | Out-Null
+
+        $key = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroup -Name $StorageAccountName -ErrorAction Stop)[0].Value
+        $global:StorageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $key
+        $global:StorageContextCreated = Get-Date
+
+        return $global:StorageContext
+    }
+    catch {
+        throw "❌ Failed to authenticate to Azure: $($_.Exception.Message)"
+    }
+}
+
+----------------------------------------------------------------------------------------------
+
+function Upload-JsonWithFallback {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][object]$JsonObject,
+        [Parameter(Mandatory)][Microsoft.WindowsAzure.Commands.Common.Storage.ResourceModel.AzureStorageContext]$StorageContext,
+        [Parameter(Mandatory)][string]$ContainerName,
+        [Parameter(Mandatory)][string]$BlobPath,
+        [Parameter()][int]$MaxRetry = 5,
+        [Parameter()][int]$InitialDelaySeconds = 2,
+        [Parameter()][string]$FallbackFolder = "C:\FailedUploads",
+        [Parameter()][string]$LogFilePath = "C:\Logs\upload_failures.log"
+    )
+
+    function Write-Log { param([string]$msg)
+        Add-Content -Path $LogFilePath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"
+    }
+
+    $jsonText = $JsonObject | ConvertTo-Json -Depth 100
+
+    $stream = New-Object System.IO.MemoryStream
+    $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
+    $writer.Write($jsonText)
+    $writer.Flush()
+    $stream.Position = 0
+
+    $retry = 0
+    $delay = $InitialDelaySeconds
+    $success = $false
+
+    while (-not $success -and $retry -lt $MaxRetry) {
+        try {
+            Set-AzStorageBlobContent -Container $ContainerName `
+                                     -Blob $BlobPath `
+                                     -Context $StorageContext `
+                                     -Stream $stream `
+                                     -Properties @{ "ContentType" = "application/json" } `
+                                     -Force -ErrorAction Stop | Out-Null
+            Write-Log "✅ Uploaded: $BlobPath"
+            $success = $true
+        }
+        catch {
+            $status = $_.Exception.Response.StatusCode.Value__
+            if ($status -eq 429 -or $status -ge 500) {
+                Write-Log "⏳ Retry $retry for $BlobPath: $($_.Exception.Message)"
+                Start-Sleep -Seconds $delay
+                $delay *= 2
+                $retry++
+                $stream.Position = 0
+            }
+            else {
+                Write-Log "❌ Upload failed (non-retryable): $($_.Exception.Message)"
+                break
+            }
+        }
+    }
+
+    if (-not $success) {
+        try {
+            $datePart = Get-Date -Format "yyyy-MM-dd\HH"
+            $localFolder = Join-Path $FallbackFolder $datePart
+            New-Item -ItemType Directory -Force -Path $localFolder | Out-Null
+
+            $safeFile = ($BlobPath -replace '[\\/:*?"<>|]', '_')
+            $filePath = Join-Path $localFolder $safeFile
+
+            $jsonText | Set-Content -Path $filePath -Encoding UTF8
+            Write-Log "📁 Fallback saved: $filePath"
+        }
+        catch {
+            Write-Log "❗ Failed to write fallback file: $($_.Exception.Message)"
+        }
+    }
+
+    $writer.Dispose()
+    $stream.Dispose()
+}
+
+---------------------------------------------------------------------------------------------
+
+function Retry-UploadFailedJsons {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][Microsoft.WindowsAzure.Commands.Common.Storage.ResourceModel.AzureStorageContext]$StorageContext,
+        [Parameter(Mandatory)][string]$ContainerName,
+        [Parameter()][string]$FallbackFolder = "C:\FailedUploads",
+        [Parameter()][string]$LogFilePath = "C:\Logs\upload_failures.log",
+        [Parameter()][int]$MaxRetry = 3
+    )
+
+    function Write-Log { param([string]$msg)
+        Add-Content -Path $LogFilePath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"
+    }
+
+    Write-Log "🔁 Retrying uploads from $FallbackFolder..."
+
+    $files = Get-ChildItem -Path $FallbackFolder -Recurse -Filter *.json -File
+    foreach ($file in $files) {
+        $retry = 0
+        $delay = 2
+        $success = $false
+
+        $blobPath = ($file.Name -replace '_', '/') -replace '\\', '/'
+
+        while (-not $success -and $retry -lt $MaxRetry) {
+            try {
+                Set-AzStorageBlobContent -Container $ContainerName `
+                                         -Blob $blobPath `
+                                         -Context $StorageContext `
+                                         -File $file.FullName `
+                                         -Properties @{ "ContentType" = "application/json" } `
+                                         -Force -ErrorAction Stop | Out-Null
+
+                Remove-Item -Path $file.FullName -Force
+                Write-Log "✅ Re-uploaded and removed: $blobPath"
+                $success = $true
+            }
+            catch {
+                $status = $_.Exception.Response.StatusCode.Value__
+                if ($status -eq 429 -or $status -ge 500) {
+                    Write-Log "⏳ Retry $retry for $blobPath: $($_.Exception.Message)"
+                    Start-Sleep -Seconds $delay
+                    $delay *= 2
+                    $retry++
+                }
+                else {
+                    Write-Log "❌ Permanent failure for $blobPath: $($_.Exception.Message)"
+                    break
+                }
+            }
+        }
+
+        if (-not $success) {
+            Write-Log "📁 Still in fallback: $($file.FullName)"
+        }
+    }
+
+    Write-Log "✅ Fallback retry pass complete."
+}
+
+------------------------------------------------------------------------------------
+
+how to run it
+
+$ctx = Get-ValidStorageContext -TenantId $using:TenantId `
+                               -ClientId $using:ClientId `
+                               -ClientSecret $using:ClientSecret `
+                               -ResourceGroup $using:ResourceGroup `
+                               -StorageAccountName $using:StorageAccountName
+
+Upload-JsonWithFallback -JsonObject $outputjson `
+                        -StorageContext $ctx `
+                        -ContainerName "callrecords" `
+                        -BlobPath "2025/Jul/07/CallRecord_abc123.json"
+
+
+----------------------------------------------------------------------------------------
+
+Retry-UploadFailedJsons -StorageContext $ctx -ContainerName "callrecords"
