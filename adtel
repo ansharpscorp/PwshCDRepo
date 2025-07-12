@@ -1,0 +1,4 @@
+for num_field in ['callerNumber', 'calleeNumber']:
+                    if num_field in rec and rec[num_field]:
+                        if not str(rec[num_field]).startswith('Tel:'):
+                            rec[num_field] = f"Tel:{rec[num_field]}"
