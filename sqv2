@@ -1,0 +1,95 @@
+CREATE OR ALTER VIEW dbo.vw_CQD_ParticipantSummary
+AS
+WITH normalized_participants AS (
+    SELECT
+        CAST([Date] AS DATE) AS CallDate,
+        ConferenceID,
+        MediaType,
+        AudioAndVideoCall,
+        ISNULL(SecondUPN, SecondPhoneNumber) AS ParticipantID
+    FROM dbo.cqd_data
+    WHERE SecondUPN IS NOT NULL OR SecondPhoneNumber IS NOT NULL
+),
+
+with_department AS (
+    SELECT
+        np.CallDate,
+        np.ConferenceID,
+        np.MediaType,
+        np.AudioAndVideoCall,
+        np.ParticipantID,
+        ud.department
+    FROM normalized_participants np
+    LEFT JOIN dbo.user_department ud ON np.ParticipantID = ud.upn
+),
+
+ranked_media AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY ConferenceID, ParticipantID
+            ORDER BY 
+                CASE 
+                    WHEN MediaType = 'Video' AND AudioAndVideoCall = 1 THEN 1
+                    WHEN MediaType = 'Audio' AND AudioAndVideoCall = 0 THEN 2
+                    ELSE 3
+                END
+        ) AS rn
+    FROM with_department
+),
+
+deduped_participants AS (
+    SELECT *
+    FROM ranked_media
+    WHERE rn = 1
+),
+
+classified_media AS (
+    SELECT
+        CallDate,
+        ConferenceID,
+        ParticipantID,
+        department,
+        CASE 
+            WHEN MediaType = 'Video' AND AudioAndVideoCall = 1 THEN 'Video'
+            ELSE 'Audio'
+        END AS MediaClass
+    FROM deduped_participants
+),
+
+conference_participants AS (
+    SELECT
+        CallDate,
+        ConferenceID,
+        department,
+        COUNT(DISTINCT ParticipantID) AS ParticipantCount,
+        COUNT(DISTINCT CASE WHEN MediaClass = 'Video' THEN ParticipantID END) AS VideoCalls,
+        COUNT(DISTINCT CASE WHEN MediaClass = 'Audio' THEN ParticipantID END) AS AudioCalls
+    FROM classified_media
+    GROUP BY CallDate, ConferenceID, department
+),
+
+bucketed AS (
+    SELECT
+        CallDate,
+        department,
+        CASE 
+            WHEN ParticipantCount < 10 THEN 'Less than 10'
+            WHEN ParticipantCount BETWEEN 10 AND 25 THEN '10 - 25'
+            WHEN ParticipantCount BETWEEN 26 AND 100 THEN '26 - 100'
+            ELSE 'More than 100'
+        END AS ParticipantBucket,
+        ConferenceID,
+        VideoCalls,
+        AudioCalls
+    FROM conference_participants
+)
+
+SELECT
+    CallDate,
+    department,
+    ParticipantBucket,
+    COUNT(DISTINCT ConferenceID) AS UniqueConferences,
+    SUM(AudioCalls) AS AudioCalls,
+    SUM(VideoCalls) AS VideoCalls
+FROM bucketed
+GROUP BY CallDate, department, ParticipantBucket;
