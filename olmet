@@ -1,0 +1,71 @@
+function Get-OnlineMeetingByJoinUrl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [string] $ClientId,
+
+        [Parameter(Mandatory)]
+        [string] $ClientSecret,
+
+        [Parameter(Mandatory)]
+        [string] $OrganizerUserId,   # UPN or objectId of the meeting organizer
+
+        [Parameter(Mandatory)]
+        [string] $JoinWebUrl         # e.g. "https://teams.microsoft.com/l/meetup-join/19:..."
+    )
+
+    # 1) Acquire a token using your existing logic
+    $accessToken = Get-AccessToken -TenantId $TenantId `
+                                   -ClientId $ClientId `
+                                   -ClientSecret $ClientSecret
+
+    # 2) Prepare headers
+    $headers = @{
+        'Authorization' = "Bearer $accessToken"
+        'Content-Type'  = 'application/json'
+    }
+
+    # 3) URL-encode the joinWebUrl before filtering :contentReference[oaicite:0]{index=0}
+    $encodedUrl = [Uri]::EscapeDataString($JoinWebUrl)
+
+    # 4) Build the GET URL with the $filter for JoinWebUrl :contentReference[oaicite:1]{index=1}
+    $filterQuery = "\$filter=JoinWebUrl%20eq%20'$encodedUrl'"
+    $uri = "https://graph.microsoft.com/v1.0/users/$OrganizerUserId/onlineMeetings?$filterQuery"
+
+    # 5) Invoke the REST call
+    try {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+    }
+    catch {
+        throw "Graph call failed: $($_.Exception.Message)"
+    }
+
+    # 6) Return the found meeting(s)
+    return $resp.value
+}
+
+# Suppose you already have:
+# function Get-AccessToken { param($TenantId,$ClientId,$ClientSecret) … }
+
+$tenantId     = 'your-tenant-id'
+$clientId     = 'your-client-id'
+$clientSecret = 'your-client-secret'
+$organizer    = 'alice@contoso.com'
+$joinUrl      = 'https://teams.microsoft.com/l/meetup-join/19%3ameeting_ABC123%40thread.v2/0?context=…'
+
+$meeting = Get-OnlineMeetingByJoinUrl `
+    -TenantId       $tenantId `
+    -ClientId       $clientId `
+    -ClientSecret   $clientSecret `
+    -OrganizerUserId $organizer `
+    -JoinWebUrl     $joinUrl
+
+if ($meeting) {
+    $meeting | Format-List id, subject, startDateTime, endDateTime, joinWebUrl
+} else {
+    Write-Host "No onlineMeeting found for that join URL."
+}
+
