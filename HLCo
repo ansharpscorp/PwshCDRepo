@@ -1,0 +1,228 @@
+# Project: TeamsCallRecordsProject
+
+# Folder Structure:
+# TeamsCallRecordsProject/
+# ├── config.json
+# ├── Get-ConferenceIdOnly.ps1
+# ├── Retry-Failed.ps1
+# └── modules/
+#     └── processor.psm1
+
+# -----------------------------
+# config.json
+# -----------------------------
+{
+  "OutputPath": "C:\\TeamsCallRecords\\Output"
+}
+
+# -----------------------------
+# Get-ConferenceIdOnly.ps1
+# -----------------------------
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$startDate,
+
+    [Parameter(Mandatory = $true)]
+    [string]$endDate
+)
+
+$ErrorActionPreference = "Stop"
+Import-Module "$PSScriptRoot\modules\processor.psm1"
+
+$config = Get-Content "$PSScriptRoot\config.json" | ConvertFrom-Json
+$outputRoot = $config.OutputPath
+
+try {
+    $startDateTime = [datetime]::ParseExact($startDate, 'yyyy-MM-dd', $null)
+    $endDateTime = [datetime]::ParseExact($endDate, 'yyyy-MM-dd', $null)
+} catch {
+    Write-Error "Date format must be yyyy-MM-dd. Error: $_"
+    exit 1
+}
+
+Export-DailyConferenceIdsParallel -StartDate $startDateTime -EndDate $endDateTime -OutputRoot $outputRoot
+
+# -----------------------------
+# Retry-Failed.ps1
+# -----------------------------
+$ErrorActionPreference = "Stop"
+Import-Module "$PSScriptRoot\modules\processor.psm1"
+
+$config = Get-Content "$PSScriptRoot\config.json" | ConvertFrom-Json
+$outputRoot = $config.OutputPath
+
+Retry-FailedIntervals -RetryFolder (Join-Path $outputRoot "_Failed") -OutputRoot $outputRoot
+
+# -----------------------------
+# modules/processor.psm1
+# -----------------------------
+$script:RetryQueue = @()
+
+function Get-AccessToken {
+    throw "Access token retrieval must be implemented here"
+}
+
+function Add-ToRetryJson {
+    param (
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [string]$OutputFolder,
+        [string]$LogFile,
+        [string]$RetryFolder
+    )
+    if (!(Test-Path $RetryFolder)) {
+        New-Item -ItemType Directory -Path $RetryFolder -Force | Out-Null
+    }
+    $retryFile = Join-Path $RetryFolder ("{0:yyyyMMdd}.retry.json" -f $StartTime)
+    $existing = @()
+    if (Test-Path $retryFile) {
+        $existing = Get-Content $retryFile | ConvertFrom-Json
+    }
+    $entry = [PSCustomObject]@{
+        StartTime = $StartTime
+        EndTime = $EndTime
+        OutputFolder = $OutputFolder
+        LogFile = $LogFile
+    }
+    $existing += $entry
+    $existing | ConvertTo-Json -Depth 4 | Set-Content -Path $retryFile -Encoding UTF8
+}
+
+function Remove-FromRetryJson {
+    param (
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [string]$RetryFolder
+    )
+    $retryFile = Join-Path $RetryFolder ("{0:yyyyMMdd}.retry.json" -f $StartTime)
+    if (!(Test-Path $retryFile)) { return }
+    $entries = Get-Content $retryFile | ConvertFrom-Json
+    $updated = $entries | Where-Object {
+        $_.StartTime -ne $StartTime.ToString("o") -or $_.EndTime -ne $EndTime.ToString("o")
+    }
+    $updated | ConvertTo-Json -Depth 4 | Set-Content -Path $retryFile -Encoding UTF8
+}
+
+function Get-HourlyConferenceIds {
+    param (
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [string]$OutputFolder,
+        [string]$Token,
+        [string]$LogFile,
+        [string]$RetryFolder
+    )
+    if (!(Test-Path $OutputFolder)) {
+        New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    }
+
+    $dateStr = $StartTime.ToString("yyyyMMdd")
+    $startHr = "{0:D2}" -f $StartTime.Hour
+    $endHr = "{0:D2}" -f $EndTime.Hour
+    $filePrefix = "{0:D2}" -f ($StartTime.Hour + 1)
+    $outputFile = Join-Path $OutputFolder "${filePrefix}ConfId_${dateStr}_${startHr}_${endHr}.csv"
+
+    $uriBase = "https://graph.microsoft.com/v1.0/communications/callRecords"
+    $uri = "$uriBase?\$filter=startDateTime ge $($StartTime.ToString("o")) and startDateTime lt $($EndTime.ToString("o"))&\$top=100"
+    $headers = @{ Authorization = "Bearer $Token" }
+
+    $callRecordIds = @()
+    $maxRetries = 3
+    $retryCount = 0
+    $success = $false
+
+    do {
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+            $callRecordIds += $response.value | Select-Object -ExpandProperty id
+            $uri = $response.'@odata.nextLink'
+            $retryCount = 0
+            $success = $true
+        } catch {
+            $retryCount++
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format o) ERROR: API failure ($retryCount/$maxRetries) for $StartTime - $EndTime: $_"
+            Start-Sleep -Seconds (5 * $retryCount)
+        }
+    } while ($uri -and $retryCount -lt $maxRetries)
+
+    if ($success -and $callRecordIds.Count -gt 0) {
+        $callRecordIds | ForEach-Object { [PSCustomObject]@{ 'Conference Id' = $_ } } |
+            Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+        Add-Content -Path $LogFile -Value "$(Get-Date -Format o) INFO: Saved $($callRecordIds.Count) IDs to $outputFile"
+        Remove-FromRetryJson -StartTime $StartTime -EndTime $EndTime -RetryFolder $RetryFolder
+    } elseif (-not $success) {
+        Add-Content -Path $LogFile -Value "$(Get-Date -Format o) FAIL: Adding to retry queue: $StartTime - $EndTime"
+        $script:RetryQueue += [PSCustomObject]@{
+            StartTime = $StartTime
+            EndTime = $EndTime
+            OutputFolder = $OutputFolder
+            LogFile = $LogFile
+        }
+        Add-ToRetryJson -StartTime $StartTime -EndTime $EndTime -OutputFolder $OutputFolder -LogFile $LogFile -RetryFolder $RetryFolder
+    } else {
+        Add-Content -Path $LogFile -Value "$(Get-Date -Format o) WARN: No records found for $StartTime - $EndTime"
+    }
+}
+
+function Retry-FailedIntervals {
+    param (
+        [string]$RetryFolder,
+        [string]$OutputRoot
+    )
+
+    $token = Get-AccessToken
+    $retryFiles = Get-ChildItem -Path $RetryFolder -Filter "*.retry.json" -File -Recurse
+    foreach ($file in $retryFiles) {
+        $entries = Get-Content $file.FullName | ConvertFrom-Json
+        foreach ($entry in $entries) {
+            try {
+                Get-HourlyConferenceIds -StartTime ([datetime]$entry.StartTime) -EndTime ([datetime]$entry.EndTime) -OutputFolder $entry.OutputFolder -Token $token -LogFile $entry.LogFile -RetryFolder $RetryFolder
+            } catch {
+                Write-Warning "Retry failed again for $($entry.StartTime)"
+            }
+        }
+    }
+}
+
+function Export-DailyConferenceIdsParallel {
+    param (
+        [datetime]$StartDate,
+        [datetime]$EndDate,
+        [string]$OutputRoot
+    )
+
+    $token = Get-AccessToken
+    $retryFolder = Join-Path $OutputRoot "_Failed"
+    $tasks = @()
+
+    for ($d = $StartDate; $d -le $EndDate; $d = $d.AddDays(1)) {
+        $dayFolder = Join-Path $OutputRoot $d.ToString("yyyyMMdd")
+        if (!(Test-Path $dayFolder)) {
+            New-Item -ItemType Directory -Path $dayFolder -Force | Out-Null
+        }
+
+        $logFile = Join-Path $dayFolder "conferenceid_download.log"
+
+        for ($h = 0; $h -lt 24; $h++) {
+            $startHr = $d.AddHours($h)
+            $endHr = $startHr.AddHours(1)
+
+            $scriptBlock = {
+                param($startTime, $endTime, $folder, $tkn, $logFile, $retryFolder)
+                Import-Module "$PSScriptRoot\processor.psm1"
+                Get-HourlyConferenceIds -StartTime $startTime -EndTime $endTime -OutputFolder $folder -Token $tkn -LogFile $logFile -RetryFolder $retryFolder
+            }
+
+            $tasks += [PSCustomObject]@{
+                Script = $scriptBlock
+                Args   = @($startHr, $endHr, $dayFolder, $token, $logFile, $retryFolder)
+            }
+        }
+    }
+
+    $tasks | ForEach-Object -Parallel {
+        $_.Script.Invoke($_.Args)
+    } -ThrottleLimit 8
+
+    Retry-FailedIntervals -RetryFolder $retryFolder -OutputRoot $OutputRoot
+}
