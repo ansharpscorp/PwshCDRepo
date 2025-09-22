@@ -1,26 +1,33 @@
-from src.io_utils import load_json, get_fs, join_uri
-from src.date_utils import to_folder_parts
 from datetime import date
+from src.io_utils import load_json, get_fs_for_path, join_uri
+from src.date_utils import to_folder_parts
 
 settings = load_json("config/settings.json")
 secrets  = load_json("config/secrets.json")
 
-fs = get_fs(secrets) if settings["input_root"].startswith("abfss://") else get_fs({"auth_mode":"local"})
+input_root = settings["input_root"].strip()
+fs = get_fs_for_path(input_root, secrets)
 
-d = date(2025, 9, 22)  # change to a date that should exist
+d = date(2025, 9, 1)  # set a date that should exist
 mmm, dd = to_folder_parts(d)
-folder = join_uri(settings["input_root"], f"{d.year}", mmm, dd)
+day_folder = join_uri(input_root, f"{d.year}", mmm, dd)
 
-print("Folder:", folder)
-print("ls():")
+print("Folder being checked:", day_folder)
+
 try:
-    print(fs.ls(folder, detail=False))
+    print("ls (first 20):")
+    entries = fs.ls(day_folder, detail=False)
+    for p in entries[:20]:
+        print("  ", p)
+    print("Total entries:", len(entries))
 except Exception as e:
     print("ls error:", e)
 
-print("find(): first 10")
 try:
-    found = list(fs.find(folder))
-    print(found[:10], f"... total={len(found)}")
+    found = [p for p in fs.find(day_folder) if not fs.isdir(p)]
+    print("find files (first 20):")
+    for p in found[:20]:
+        print("  ", p)
+    print("Total files:", len(found))
 except Exception as e:
     print("find error:", e)
