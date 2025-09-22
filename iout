@@ -1,0 +1,34 @@
+def list_json_files(fs, folder_uri: str) -> List[str]:
+    """
+    Return JSON files inside folder_uri (non-recursive),
+    falling back to recursive search if nothing is found.
+    Works reliably for local and ABFSS.
+    """
+    base = folder_uri.rstrip("/")
+
+    files: List[str] = []
+    try:
+        # 1) Non-recursive listing (preferred)
+        entries = fs.ls(base, detail=False)  # exact list of children
+        for p in entries:
+            if not fs.isdir(p) and p.lower().endswith(".json"):
+                files.append(p)
+    except Exception:
+        # Some FS may not support ls; ignore and try find()
+        pass
+
+    if not files:
+        # 2) Fallback: recursive search (handles day folders that contain subfolders)
+        try:
+            for p in fs.find(base):
+                if not fs.isdir(p) and p.lower().endswith(".json"):
+                    files.append(p)
+        except Exception:
+            # Final fallback: try glob recursively (some adlfs versions support **)
+            for p in fs.glob(base + "/**/*.json"):
+                if not fs.isdir(p):
+                    files.append(p)
+
+    files.sort()
+    info("Listed files", folder=base, count=len(files))
+    return files
