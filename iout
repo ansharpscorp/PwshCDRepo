@@ -1,30 +1,76 @@
+from typing import List
+import json
+import fsspec
+from urllib.parse import urlparse
+from .logger import info
+
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def is_abfs_uri(uri: str) -> bool:
+    """Case-insensitive check for abfs/abfss scheme."""
+    scheme = urlparse((uri or "").strip()).scheme.lower()
+    return scheme in ("abfs", "abfss")
+
+def get_fs_from_secrets(secrets: dict):
+    """Legacy helper (kept for compatibility). Prefer get_fs_for_path."""
+    mode = (secrets.get("auth_mode") or "local").lower()
+    if mode == "local":
+        return fsspec.filesystem("file")
+    elif mode == "abfss" or mode == "abfs":
+        return fsspec.filesystem(
+            "abfss",
+            account_name=secrets["account_name"],
+            tenant_id=secrets["tenant_id"],
+            client_id=secrets["client_id"],
+            client_secret=secrets["client_secret"],
+        )
+    else:
+        raise ValueError(f"Unknown auth_mode: {mode}")
+
+def get_fs_for_path(path_root: str, secrets: dict):
+    """
+    Pick filesystem by URI scheme in path_root (robust).
+    abfs/abfss => ADLS Gen2 (adlfs); otherwise local.
+    """
+    if is_abfs_uri(path_root):
+        return fsspec.filesystem(
+            "abfss",
+            account_name=secrets["account_name"],
+            tenant_id=secrets["tenant_id"],
+            client_id=secrets["client_id"],
+            client_secret=secrets["client_secret"],
+        )
+    else:
+        return fsspec.filesystem("file")
+
 def list_json_files(fs, folder_uri: str) -> List[str]:
     """
     Return JSON files inside folder_uri (non-recursive),
-    falling back to recursive search if nothing is found.
-    Works reliably for local and ABFSS.
+    with robust fallbacks that work on local and ABFSS.
     """
-    base = folder_uri.rstrip("/")
+    base = (folder_uri or "").rstrip("/")
 
     files: List[str] = []
     try:
-        # 1) Non-recursive listing (preferred)
-        entries = fs.ls(base, detail=False)  # exact list of children
+        # Prefer exact, non-wildcard listing.
+        entries = fs.ls(base, detail=False)
         for p in entries:
+            # Some filesystems can return dicts when detail=True; we used detail=False.
             if not fs.isdir(p) and p.lower().endswith(".json"):
                 files.append(p)
     except Exception:
-        # Some FS may not support ls; ignore and try find()
         pass
 
     if not files:
-        # 2) Fallback: recursive search (handles day folders that contain subfolders)
+        # Fallback: recursive search
         try:
             for p in fs.find(base):
                 if not fs.isdir(p) and p.lower().endswith(".json"):
                     files.append(p)
         except Exception:
-            # Final fallback: try glob recursively (some adlfs versions support **)
+            # Last resort: recursive glob
             for p in fs.glob(base + "/**/*.json"):
                 if not fs.isdir(p):
                     files.append(p)
@@ -32,3 +78,16 @@ def list_json_files(fs, folder_uri: str) -> List[str]:
     files.sort()
     info("Listed files", folder=base, count=len(files))
     return files
+
+def join_uri(root: str, *parts: str) -> str:
+    # Simple, scheme-agnostic join that preserves abfss://
+    base = (root or "").rstrip("/")
+    tail = "/".join((p or "").strip("/") for p in parts if p is not None)
+    return f"{base}/{tail}".rstrip("/")
+    
+def ensure_dir(fs, dir_uri: str):
+    try:
+        fs.makedirs(dir_uri, exist_ok=True)
+    except Exception:
+        # Some remote FS create dirs implicitly on write
+        pass
