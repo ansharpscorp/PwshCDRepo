@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+from datetime import date
+from .logger import info, warn, err
+from .io_utils import load_json, get_fs_for_path, list_json_files, join_uri, ensure_dir
+from .date_utils import ymd_range, to_folder_parts, is_weekend
+from .flattener import parse_json_bytes, flatten_callrecord
+from .writer import CallRecordShardWriter
+
+def run(settings_path: str, secrets_path: str, columns_path: str):
+    settings = load_json(settings_path)
+    secrets  = load_json(secrets_path)
+    columns  = load_json(columns_path)
+
+    input_root  = settings["input_root"].strip()
+    output_root = settings["output_root"].strip()
+
+    year        = int(settings["year"])
+    start_date  = date.fromisoformat(settings["start_date"])
+    end_date    = date.fromisoformat(settings["end_date"])
+
+    skip_weekends     = bool(settings.get("skip_weekends", False))
+    weekday_limit     = int(settings.get("weekday_callrecords_per_file", 50000))
+    weekend_one_file  = bool(settings.get("weekend_one_file", True))
+    weekend_limit     = int(settings.get("weekend_callrecords_per_file", 10000))
+
+    row_group_size    = int(settings.get("row_group_size", 10000))
+    compression       = settings.get("compression", "snappy")
+    max_files_per_day = int(settings.get("max_files_per_day", 999999))
+
+    fs_in  = get_fs_for_path(input_root, secrets)
+    fs_out = get_fs_for_path(output_root, secrets)
+
+    for d in ymd_range(start_date, end_date):
+        if d.year != year:
+            continue
+        if is_weekend(d) and skip_weekends:
+            info("Skipping weekend", date=d.isoformat())
+            continue
+
+        mmm, dd = to_folder_parts(d)
+        year_str = f"{d.year}"
+
+        # Input path
+        day_folder = join_uri(input_root, year_str, mmm, dd)
+        info("Processing day", day=d.isoformat(), folder=day_folder)
+
+        files = list_json_files(fs_in, day_folder)
+        if not files:
+            warn("No files for day", date=d.isoformat())
+            continue
+
+        # Output path
+        out_day_dir = join_uri(output_root, year_str, mmm, dd)
+        ensure_dir(fs_out, out_day_dir)
+
+        if is_weekend(d):
+            per_file_limit = (len(files) if weekend_one_file else max(weekend_limit, 1))
+        else:
+            per_file_limit = max(weekday_limit, 1)
+
+        writer = CallRecordShardWriter(
+            fs_out=fs_out,
+            out_day_dir_uri=out_day_dir,
+            callrecords_per_file=per_file_limit,
+            row_group_size=row_group_size,
+            compression=compression,
+            columns=columns
+        )
+
+        processed = 0
+        rows_written = 0
+        calls_written = 0
+        total_files = min(len(files), max_files_per_day)
+
+        for idx, fp in enumerate(files[:max_files_per_day], start=1):
+            try:
+                info("Reading file", file=fp, counter=idx, total=total_files)
+                with fs_in.open(fp, "rb") as f:
+                    data = f.read()
+                rec = parse_json_bytes(data)
+                rows = list(flatten_callrecord(rec))
+
+                r, c, outfile = writer.add_callrecord(rows)
+                rows_written += r
+                calls_written += c
+                processed += 1
+
+                if outfile:
+                    info("Saved output", file=outfile, rows=r, callrecords=c)
+
+                if processed % 1000 == 0:
+                    pct = round((processed / total_files) * 100, 2)
+                    info("Progress", processed=processed,
+                         total=total_files,
+                         pct=pct,
+                         rows_written=rows_written,
+                         callrecords=calls_written)
+            except Exception as e:
+                err("Failed file", file=fp, error=str(e))
+
+        r, c, outfile = writer.flush()
+        rows_written += r
+        calls_written += c
+        if outfile:
+            info("Saved output", file=outfile, rows=r, callrecords=c)
+
+        info("Day complete", date=d.isoformat(),
+             files=processed, total_files=total_files,
+             rows=rows_written, callrecords=calls_written)
+
+def main():
+    ap = argparse.ArgumentParser(description="CallRecord JSON → Parquet with column whitelist.")
+    ap.add_argument("--settings", default="config/settings.json")
+    ap.add_argument("--secrets",  default="config/secrets.json")
+    ap.add_argument("--columns",  default="config/columns.json")
+    args = ap.parse_args()
+    run(args.settings, args.secrets, args.columns)
+
+if __name__ == "__main__":
+    main()
