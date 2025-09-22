@@ -1,0 +1,26 @@
+from src.io_utils import load_json, get_fs, join_uri
+from src.date_utils import to_folder_parts
+from datetime import date
+
+settings = load_json("config/settings.json")
+secrets  = load_json("config/secrets.json")
+
+fs = get_fs(secrets) if settings["input_root"].startswith("abfss://") else get_fs({"auth_mode":"local"})
+
+d = date(2025, 9, 22)  # change to a date that should exist
+mmm, dd = to_folder_parts(d)
+folder = join_uri(settings["input_root"], f"{d.year}", mmm, dd)
+
+print("Folder:", folder)
+print("ls():")
+try:
+    print(fs.ls(folder, detail=False))
+except Exception as e:
+    print("ls error:", e)
+
+print("find(): first 10")
+try:
+    found = list(fs.find(folder))
+    print(found[:10], f"... total={len(found)}")
+except Exception as e:
+    print("find error:", e)
