@@ -1,0 +1,27 @@
+# Core fields
+- callRecordId
+- callStart
+- callEnd
+- modalitiesJoined
+- sessionId
+- participantRole
+- identityType
+- userId
+- userTenantId
+- userDisplayName
+- userUPN
+- phoneNumber
+
+# New endpoint details added in flattener (role-specific)
+- endpointPlatform
+- endpointProductFamily
+- endpointName
+
+# Optional derived/renamed fields
+- { name: identityAny, coalesce: [userUPN, phoneNumber, userId], default: null }
+
+# Raw JSON path examples you can add (the writer resolves these from __raw):
+# - { name: organizerV2Count, count_of: organizer_v2 }
+# - { name: participantV2Ids, path: participants_v2, join: ";", subpath: identity.user.id }
+# - { name: firstModality, first_of: modalities }
+# - { name: joinUrl, path: joinWebUrl }
