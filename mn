@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dateutil.parser import isoparse
+import os
+
+from .logger import info, warn, err, get_logfile_path, RUN_ID
+from .io_utils import (
+    load_json, load_yaml, get_fs_for_path, iter_files,
+    to_relative_path, join_uri, replace_ext,
+    daterange, month_mmm, day_dd
+)
+from .flattener import parse_json_bytes, flatten_callrecord
+from .writer import write_parquet_one_file
+
+def build_output_path(input_root: str,
+                      output_root: str,
+                      in_path: str,
+                      day_folder: str,
+                      output_structure: str) -> str:
+    """
+    - mirror_full:  output_root + (relative path of in_path under input_root) with .parquet
+    - date_only:    output_root/YYYY/MMM/DD/<basename>.parquet
+    """
+    if output_structure == "date_only":
+        # Use the day folder components and the input file's basename
+        base = os.path.basename(in_path)
+        base_parquet = replace_ext(base, ".parquet")
+        # day_folder looks like .../<input_root>/YYYY/MMM/DD
+        # Extract YYYY/MMM/DD tail relative to input_root:
+        rel_day = to_relative_path(input_root, day_folder)
+        return join_uri(output_root, rel_day, base_parquet)
+    # default: mirror_full
+    rel = to_relative_path(input_root, in_path)
+    out_rel = replace_ext(rel, ".parquet")
+    return join_uri(output_root, out_rel)
+
+def process_one_file(in_path: str,
+                     input_root: str,
+                     output_root: str,
+                     day_folder: str,
+                     output_structure: str,
+                     secrets: dict,
+                     columns,
+                     include_ext,
+                     compression: str):
+    fs_in  = get_fs_for_path(input_root, secrets)
+    fs_out = get_fs_for_path(output_root, secrets)
+
+    with fs_in.open(in_path, "rb") as f:
+        data = f.read()
+    rec = parse_json_bytes(data)
+    rows = list(flatten_callrecord(rec))
+
+    out_path = build_output_path(input_root, output_root, in_path, day_folder, output_structure)
+    write_parquet_one_file(fs_out, out_path, rows, columns=columns, compression=compression)
+    return out_path, len(rows)
+
+def run(settings_path: str, secrets_path: str, columns_path: str):
+    settings = load_json(settings_path)
+    secrets  = load_json(secrets_path)
+    columns  = load_yaml(columns_path)
+
+    input_root       = settings["input_root"].strip()
+    output_root      = settings["output_root"].strip()
+    start_date       = isoparse(settings["start_date"]).date()
+    end_date         = isoparse(settings["end_date"]).date()
+    recursive_day    = bool(settings.get("recursive_day", False))
+    include_ext      = settings.get("include_ext", [".json"])
+    compression      = settings.get("compression", "snappy")
+    log_dir          = settings.get("log_dir", "logs")
+    concurrency      = int(settings.get("concurrency", 8))
+    output_structure = (settings.get("output_structure") or "mirror_full").strip()
+
+    info("Run started", run_id=RUN_ID, logfile=get_logfile_path(),
+         input_root=input_root, output_root=output_root,
+         start_date=str(start_date), end_date=str(end_date),
+         recursive_day=recursive_day, concurrency=concurrency,
+         output_structure=output_structure, log_dir=log_dir)
+
+    total_files_written = 0
+
+    for d in daterange(start_date, end_date):
+        y   = f"{d.year}"
+        mmm = month_mmm(d)   # 'Sep', 'Aug', ...
+        dd  = day_dd(d)      # '22'
+
+        day_folder = join_uri(input_root, y, mmm, dd)
+        info("Processing day", day=str(d), folder=day_folder)
+
+        fs_lister = get_fs_for_path(input_root, secrets)
+        files = list(iter_files(fs_lister, day_folder, recursive=recursive_day, include_ext=include_ext))
+        if not files:
+            warn("No files found for day", day=str(d), folder=day_folder)
+            continue
+
+        info("Submitting tasks", day=str(d), files=len(files), concurrency=concurrency)
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            for in_path in files:
+                futures.append(
+                    ex.submit(
+                        process_one_file,
+                        in_path,
+                        input_root,
+                        output_root,
+                        day_folder,
+                        output_structure,
+                        secrets,
+                        columns,
+                        include_ext,
+                        compression
+                    )
+                )
+
+            for i, fut in enumerate(as_completed(futures), start=1):
+                try:
+                    out_path, nrows = fut.result()
+                    total_files_written += 1
+                    if i % 100 == 0 or i == len(futures):
+                        pct = round(100.0 * i / len(futures), 2)
+                        info("Progress", day=str(d), completed=i, total=len(futures), pct=pct)
+                except Exception as e:
+                    err("Worker failed", error=str(e))
+
+        info("Day complete", day=str(d), files=len(files), written=len(futures))
+
+    info("Run finished", processed=total_files_written, run_id=RUN_ID, logfile=get_logfile_path())
+
+def main():
+    ap = argparse.ArgumentParser(description="JSON → Parquet (1:1) with session-participant identities; parallel I/O.")
+    ap.add_argument("--settings", default="config/settings.json")
+    ap.add_argument("--secrets",  default="config/secrets.json")
+    ap.add_argument("--columns",  default="config/columns.yml")
+    args = ap.parse_args()
+    run(args.settings, args.secrets, args.columns)
+
+if __name__ == "__main__":
+    main()
