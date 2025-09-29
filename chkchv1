@@ -1,0 +1,223 @@
+from typing import Dict, List, Union, Optional, Any, Iterable
+import pyarrow as pa
+import pyarrow.parquet as pq
+from .logger import info, warn
+
+ColumnSpec = Union[str, Dict[str, object]]
+
+# ---------- raw JSON path helpers ----------
+def _as_list(x):
+    if isinstance(x, list): return x
+    if x is None or x == "": return []
+    return [x]
+
+def _get_path(obj: Any, dotted: str):
+    """
+    Resolve dotted path like 'a.b[0].c' safely over dict/list.
+    Supports [index] for arrays. Returns None if path is invalid.
+    """
+    if obj is None or dotted is None: return None
+    if not isinstance(dotted, str):
+        return None
+    cur = obj
+    parts = [p for p in dotted.replace("]", "").split(".")]
+    for part in parts:
+        if part == "": continue
+        while "[" in part:
+            key, idx = part.split("[", 1)
+            if key:
+                if not isinstance(cur, dict) or key not in cur: return None
+                cur = cur[key]
+            try:
+                i = int(idx)
+            except Exception:
+                return None
+            if not isinstance(cur, list): return None
+            if i < 0 or i >= len(cur): return None
+            cur = cur[i]
+            part = ""
+        if part:
+            if not isinstance(cur, dict) or part not in cur: return None
+            cur = cur[part]
+    return cur
+
+def _project_items(items: List[Any], subpath: Optional[str]) -> List[Any]:
+    out: List[Any] = []
+    for it in _as_list(items):
+        if subpath:
+            v = _get_path(it, subpath)
+            if v is not None: out.append(v)
+        else:
+            out.append(it)
+    return out
+
+def _ensure_list(x: Any) -> List:
+    if x is None: return []
+    if isinstance(x, list): return x
+    # allow single scalar to be treated as 1-item list
+    return [x]
+
+def _clean_columns(columns: Optional[Iterable[ColumnSpec]]) -> List[ColumnSpec]:
+    """
+    Remove empty/None specs and ensure we have a list.
+    """
+    if not columns:
+        return []
+    out: List[ColumnSpec] = []
+    for spec in columns:
+        if spec is None:  # stray '-' in YAML becomes null
+            warn("Ignoring empty column spec (null).")
+            continue
+        if spec == {}:
+            warn("Ignoring empty column spec ({}).")
+            continue
+        if isinstance(spec, str) and spec.strip() == "":
+            warn("Ignoring empty column spec ('').")
+            continue
+        out.append(spec)
+    return out
+
+# ---------- apply a single column spec ----------
+def _apply_column_spec(row: Dict, spec: ColumnSpec) -> Dict:
+    # Simple: keep a flat field
+    if isinstance(spec, str):
+        return {spec: row.get(spec)}
+
+    if not isinstance(spec, dict):
+        warn("Ignoring non-dict column spec", spec_repr=str(spec))
+        return {}
+
+    # If user wrote just {from: x} or {path: y} without name, derive one
+    name = spec.get("name")
+    if not name:
+        if "from" in spec and isinstance(spec["from"], str):
+            name = spec["from"]
+        elif "path" in spec and isinstance(spec["path"], str):
+            # last token of path as default name
+            last = spec["path"].rstrip("]").split(".")[-1]
+            name = last.replace("[", "_idx_")
+        elif "count_of" in spec and isinstance(spec["count_of"], str):
+            name = f"count_{spec['count_of'].split('.')[-1].replace('[','_idx_')}"
+        elif "first_of" in spec and isinstance(spec["first_of"], str):
+            name = f"first_{spec['first_of'].split('.')[-1].replace('[','_idx_')}"
+        else:
+            warn("Ignoring column spec without resolvable name", spec_repr=str(spec))
+            return {}
+
+    # rename from flat
+    if "from" in spec:
+        return {name: row.get(spec["from"])}
+
+    # coalesce flat (accept string or list)
+    if "coalesce" in spec:
+        keys = spec.get("coalesce")
+        keys_list = _ensure_list(keys)
+        val = None
+        for key in keys_list:
+            if not isinstance(key, str): 
+                continue
+            val = row.get(key)
+            if val is not None:
+                break
+        if val is None:
+            val = spec.get("default")
+        return {name: val}
+
+    raw = row.get("__raw")
+
+    # path into raw (optionally join/subpath)
+    if "path" in spec:
+        val = _get_path(raw, spec["path"])
+        if "join" in spec:
+            delimiter = spec.get("join") or ";"
+            subpath = spec.get("subpath")
+            values = _project_items(_as_list(val), subpath)
+            values = [str(v) for v in values if v is not None and str(v) != ""]
+            return {name: delimiter.join(values) if values else None}
+        return {name: val}
+
+    # count_of array at path
+    if "count_of" in spec:
+        arr = _get_path(raw, spec["count_of"])
+        return {name: len(_as_list(arr))}
+
+    # first_of array at path (optional subpath)
+    if "first_of" in spec:
+        arr = _get_path(raw, spec["first_of"])
+        subpath = spec.get("subpath")
+        values = _project_items(_as_list(arr), subpath)
+        return {name: (values[0] if values else None)}
+
+    warn("Column spec had no recognized directive; writing null", spec_repr=str(spec))
+    return {name: None}
+
+def _filter_columns(rows: List[Dict], columns: Optional[List[ColumnSpec]]) -> List[Dict]:
+    cleaned = _clean_columns(columns)
+    if not cleaned:
+        # also strip __raw if present
+        return [{k: v for k, v in r.items() if k != "__raw"} for r in rows]
+    out: List[Dict] = []
+    for r in rows:
+        new_r: Dict = {}
+        for spec in cleaned:
+            try:
+                new_r.update(_apply_column_spec(r, spec))
+            except Exception as e:
+                warn("Failed applying column spec; writing nulls for this spec",
+                     error=str(e), spec_repr=str(spec))
+                # best-effort: try to fill with None using name if possible
+                if isinstance(spec, dict):
+                    nm = spec.get("name") or spec.get("from") or spec.get("path") or "unknown"
+                    new_r[str(nm)] = None
+        out.append(new_r)
+    return out
+
+def write_parquet_one_file(fs_out, out_path: str, rows: List[Dict],
+                           columns: Optional[List[ColumnSpec]] = None,
+                           compression: str = "snappy"):
+    filtered = _filter_columns(rows, columns)
+    table = pa.Table.from_pylist(filtered)
+    parent = "/".join(out_path.split("/")[:-1])
+    try:
+        fs_out.makedirs(parent, exist_ok=True)
+    except Exception:
+        pass
+    with fs_out.open(out_path, "wb") as f:
+        pq.write_table(table, f, compression=compression)
+    info("Saved parquet", file=out_path, rows=len(filtered))
+
+
+
+
+  main
+# ... inside run(), after loading columns ...
+if not columns:
+    warn("No columns specified; will write all flattened fields (and strip __raw).")
+
+
+  col
+# Simple flat fields (from flattener)
+- callRecordId
+- callStart
+- callEnd
+- modalitiesJoined
+- sessionId
+- participantRole
+- identityType
+- userId
+- userTenantId
+- userDisplayName
+- userUPN
+- phoneNumber
+
+# Rename a flat field
+- { name: startedAt, from: callStart }
+
+# Coalesce across flat fields (string OR list both work)
+- { name: identityAny, coalesce: [userUPN, phoneNumber, userId], default: null }
+# or
+# - { name: identityAny, coalesce: userUPN, default: null }
+
+# Raw JSON path fields (optional)
+- { name: joinUrl, path: joinWebUrl }
+- { name: firstModality, first_of: modalities }
