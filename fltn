@@ -1,0 +1,179 @@
+import json
+from typing import Any, Dict, Iterable, List, Optional
+
+def parse_json_bytes(b: bytes):
+    return json.loads(b.decode("utf-8"))
+
+# ---------- safe helpers ----------
+def as_list(x) -> List:
+    if isinstance(x, list):
+        return x
+    if x is None or x == "":
+        return []
+    return [x]
+
+def as_dict(x) -> Dict:
+    return x if isinstance(x, dict) else {}
+
+def get(d, *keys, default=None):
+    cur = d or {}
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+def join_semicolon(values: List[Any]) -> Optional[str]:
+    vals = [str(v) for v in values if v is not None and str(v) != ""]
+    return ";".join(vals) if vals else None
+
+# ---------- identity normalization ----------
+def normalize_identity_from_associated(ident: Dict[str, Any]) -> Dict[str, Any]:
+    ident = as_dict(ident)
+    if "userPrincipalName" in ident or "tenantId" in ident:
+        return {
+            "identityType": "user",
+            "userId": ident.get("id"),
+            "userTenantId": ident.get("tenantId"),
+            "userDisplayName": ident.get("displayName"),
+            "userUPN": ident.get("userPrincipalName"),
+            "phoneNumber": None,
+        }
+    if "number" in ident:
+        return {
+            "identityType": "phone",
+            "userId": None,
+            "userTenantId": None,
+            "userDisplayName": None,
+            "userUPN": None,
+            "phoneNumber": ident.get("number"),
+        }
+    return {
+        "identityType": "unknown",
+        "userId": ident.get("id"),
+        "userTenantId": ident.get("tenantId"),
+        "userDisplayName": ident.get("displayName"),
+        "userUPN": ident.get("userPrincipalName"),
+        "phoneNumber": ident.get("number"),
+    }
+
+def normalize_identity_from_v2(identity: Dict[str, Any]) -> Dict[str, Any]:
+    identity = as_dict(identity)
+    u = as_dict(identity.get("user"))
+    p = as_dict(identity.get("phone"))
+    if u:
+        return {
+            "identityType": "user",
+            "userId": u.get("id"),
+            "userTenantId": u.get("tenantId"),
+            "userDisplayName": u.get("displayName"),
+            "userUPN": u.get("userPrincipalName"),
+            "phoneNumber": None,
+        }
+    if p:
+        return {
+            "identityType": "phone",
+            "userId": None,
+            "userTenantId": None,
+            "userDisplayName": None,
+            "userUPN": None,
+            "phoneNumber": p.get("number") or p.get("id"),
+        }
+    return {
+        "identityType": "unknown",
+        "userId": None,
+        "userTenantId": None,
+        "userDisplayName": None,
+        "userUPN": None,
+        "phoneNumber": None,
+    }
+
+def extract_endpoint_identity(party: Dict[str, Any]) -> Dict[str, Any]:
+    party = as_dict(party)
+    if "associatedIdentity" in party and party["associatedIdentity"]:
+        return normalize_identity_from_associated(party["associatedIdentity"])
+    if "identity" in party and party["identity"]:
+        return normalize_identity_from_v2(party["identity"])
+    return {
+        "identityType": "unknown",
+        "userId": None,
+        "userTenantId": None,
+        "userDisplayName": party.get("name"),
+        "userUPN": None,
+        "phoneNumber": None,
+    }
+
+def extract_endpoint_details(party: Dict[str, Any]) -> Dict[str, Any]:
+    """Non-identity endpoint details useful for analysis."""
+    ua = as_dict(get(as_dict(party), "userAgent"))
+    return {
+        "endpointPlatform": ua.get("platform"),
+        "endpointProductFamily": ua.get("productFamily"),
+        "endpointName": as_dict(party).get("name"),
+    }
+
+# ---------- main flattener ----------
+def flatten_callrecord(obj: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """
+    Emit one row per (session × participantRole[caller|callee]).
+    If sessions missing/empty, emit a single row with session & identity fields null.
+    """
+    obj = as_dict(obj)
+
+    call_id    = obj.get("id")
+    call_start = obj.get("startDateTime")
+    call_end   = obj.get("endDateTime")
+    modalities = as_list(obj.get("modalities"))
+    modalities_joined = join_semicolon(modalities)
+
+    sessions = as_list(obj.get("sessions"))
+
+    if not sessions:
+        yield {
+            "callRecordId": call_id,
+            "callStart": call_start,
+            "callEnd": call_end,
+            "modalitiesJoined": modalities_joined,
+            "sessionId": None,
+            "participantRole": None,
+            "identityType": None,
+            "userId": None,
+            "userTenantId": None,
+            "userDisplayName": None,
+            "userUPN": None,
+            "phoneNumber": None,
+            "endpointPlatform": None,
+            "endpointProductFamily": None,
+            "endpointName": None,
+            "__raw": obj,
+        }
+        return
+
+    for s in sessions:
+        s = as_dict(s)
+        session_id = s.get("id")
+
+        for role_key, role_name in (("caller", "caller"), ("callee", "callee")):
+            party = as_dict(s.get(role_key))
+            ident = extract_endpoint_identity(party)
+            edet  = extract_endpoint_details(party)
+
+            row = {
+                "callRecordId": call_id,
+                "callStart": call_start,
+                "callEnd": call_end,
+                "modalitiesJoined": modalities_joined,
+                "sessionId": session_id,
+                "participantRole": role_name,
+                "identityType": ident["identityType"],
+                "userId": ident["userId"],
+                "userTenantId": ident["userTenantId"],
+                "userDisplayName": ident["userDisplayName"],
+                "userUPN": ident["userUPN"],
+                "phoneNumber": ident["phoneNumber"],
+                "endpointPlatform": edet["endpointPlatform"],
+                "endpointProductFamily": edet["endpointProductFamily"],
+                "endpointName": edet["endpointName"],
+                "__raw": obj,
+            }
+            yield row
