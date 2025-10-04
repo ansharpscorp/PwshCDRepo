@@ -1,0 +1,21 @@
+print(f"Listing {src_prefix} (timeout={args.list_timeout}s) …", flush=True)
+try:
+    # approximate limit if --list-max-pages and --list-page-size are given
+    max_items = None
+    if args.list_max_pages and args.list_max_pages > 0:
+        max_items = args.list_page_size * args.list_max_pages
+
+    blobs = list(
+        iter_json_blobs_paged(
+            src_cc,
+            prefix=src_prefix,
+            timeout=args.list_timeout,
+            max_items=max_items,
+        )
+    )
+    print(f"Found {len(blobs)} files in {src_prefix}", flush=True)
+
+except Exception as e:
+    jlog(day_logs.error, logging.ERROR, "list_error", day_prefix=src_prefix, error=str(e))
+    print(f"[LIST ERROR] {src_prefix}: {e}", file=sys.stderr, flush=True)
+    continue
