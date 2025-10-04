@@ -1,0 +1,299 @@
+from __future__ import annotations
+import argparse
+import os
+import io
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Iterable, Tuple, Dict
+import yaml
+import orjson
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
+from datetime import date, timedelta
+import calendar
+import logging
+
+from azure.identity import DefaultAzureCredential
+from azure_io import (
+    make_container_client,
+    iter_json_blobs_paged,
+    download_text,
+    upload_bytes,
+)
+from flattener import build_rows
+from settings_loader import load_settings, apply_auth_env
+from log_utils import DayLoggers, setup_day_loggers, day_loggers_from_prefix, jlog
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Parallel callRecord JSON → Parquet (date-ranged, mirrored; 3 logs/day)"
+    )
+    p.add_argument("--settings", default="settings.json", help="Path to settings.json")
+    p.add_argument("--columns-yaml", default="columns.yml")
+    p.add_argument("--max-workers", type=int, default=min(32, (os.cpu_count() or 8) * 5))
+    p.add_argument("--limit", type=int, default=0, help="Total limit across all days (0=no limit)")
+    p.add_argument("--verbose", action="store_true", help="Print first few errors to console")
+    # listing controls (version-proof)
+    p.add_argument("--list-timeout", type=int, default=60, help="Seconds per listing request")
+    p.add_argument("--list-page-size", type=int, default=200, help="Logical page size (for caps)")
+    p.add_argument("--list-max-pages", type=int, default=0, help="Cap items via page_size*max_pages (0=off)")
+    return p.parse_args()
+
+
+def preflight(args):
+    # Python
+    if sys.version_info < (3, 9):
+        raise RuntimeError("Python 3.9+ is required")
+
+    # Packages sanity
+    try:
+        import azure.storage.blob  # noqa
+        import azure.identity  # noqa
+        import pandas  # noqa
+        import pyarrow  # noqa
+    except Exception as e:
+        raise RuntimeError(
+            "Missing required packages. Did you run 'pip install -r requirements.txt'?"
+        ) from e
+
+    # Files exist
+    if not os.path.exists(args.settings):
+        raise FileNotFoundError(f"settings file not found: {args.settings}")
+    if not os.path.exists(args.columns_yaml):
+        raise FileNotFoundError(f"columns YAML not found: {args.columns_yaml}")
+
+
+def load_config(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        y = yaml.safe_load(f)
+    cols = y.get("columns", [])
+    sess_cols = y.get("session_columns", [])
+    if not isinstance(cols, list) or not isinstance(sess_cols, list):
+        raise ValueError("columns.yml must contain 'columns' and 'session_columns' lists")
+    return cols, sess_cols  # no sanitization needed (single dots only)
+
+
+def to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="snappy")
+    return sink.getvalue()
+
+
+def derive_output_name(input_blob_name: str, dst_prefix: str) -> str:
+    base = os.path.basename(input_blob_name)
+    stem = base[:-5] if base.lower().endswith(".json") else base
+    out_name = f"{stem}.parquet"
+    return f"{dst_prefix.rstrip('/')}/{out_name}" if dst_prefix else out_name
+
+
+def process_one(
+    blob_name: str,
+    src_cc,
+    dst_cc,
+    columns: List[str],
+    session_columns: List[str],
+    dst_prefix: str,
+    day_logs: DayLoggers,
+    verbose: bool,
+    console_err_counter: Dict[str, int],
+) -> Optional[str]:
+    """
+    Returns dst blob path on success, "ERROR::..." on failure, or None if skipped (no rows).
+    """
+    try:
+        raw = download_text(src_cc, blob_name)
+        rec = orjson.loads(raw)
+
+        ordered_cols, rows = build_rows(rec, columns, session_columns)
+
+        if not rows:  # nothing to emit → SKIPPED
+            jlog(day_logs.skipped, logging.INFO, "file_skipped", src_blob=blob_name, reason="no_rows_built")
+            return None
+
+        df = pd.DataFrame(rows, columns=ordered_cols)
+        parquet_bytes = to_parquet_bytes(df)
+        dst_blob = derive_output_name(blob_name, dst_prefix)
+        upload_bytes(dst_cc, dst_blob, parquet_bytes, overwrite=True)
+
+        jlog(day_logs.processed, logging.INFO, "file_processed", src_blob=blob_name, dst_blob=dst_blob, rows=len(df))
+        return dst_blob
+
+    except Exception as e:
+        msg = str(e)
+        jlog(day_logs.error, logging.ERROR, "file_error", src_blob=blob_name, error=msg)
+        if verbose and console_err_counter["n"] < 5:
+            console_err_counter["n"] += 1
+            print(f"[ERROR] {blob_name} -> {msg}", file=sys.stderr)
+        return f"ERROR::{blob_name}::{e}"
+
+
+def _month_abbr_en(month_int: int) -> str:
+    return calendar.month_abbr[month_int]  # 'Jan', 'Feb', 'Mar', ...
+
+
+def _date_prefix(d: date) -> str:
+    return f"{d.year}/{_month_abbr_en(d.month)}/{d.day:02d}/"  # "YYYY/MMM/dd/"
+
+
+def _join_prefix(root_prefix: str, date_prefix: str) -> str:
+    root = (root_prefix or "").strip("/")
+    dp = date_prefix.strip("/")
+    joined = f"{root}/{dp}" if root else dp
+    return joined if joined.endswith("/") else joined + "/"
+
+
+def _iter_dates(start_str: str, end_str: str) -> Iterable[date]:
+    y1, m1, d1 = map(int, start_str.split("-"))
+    y2, m2, d2 = map(int, end_str.split("-"))
+    start_d = date(y1, m1, d1)
+    end_d = date(y2, m2, d2)
+    if end_d < start_d:
+        raise ValueError("date_range.end is before date_range.start")
+    cur = start_d
+    one = timedelta(days=1)
+    while cur <= end_d:
+        yield cur
+        cur += one
+
+
+def main():
+    args = parse_args()
+    preflight(args)
+
+    settings = load_settings(args.settings)
+    apply_auth_env(settings)
+
+    use_default_cred = bool(settings.get("auth", {}).get("use_default_credential", False))
+    credential = DefaultAzureCredential() if use_default_cred else None
+    sas = settings.get("_resolved", {}).get("sas_token")
+
+    src = settings.get("source", {})
+    dst = settings.get("destination", {})
+
+    # Make clients early to fail fast on bad auth
+    src_cc = make_container_client(
+        account_url=src.get("account_url"),
+        container=src.get("container"),
+        credential=credential,
+        sas_token=sas,
+    )
+    dst_cc = make_container_client(
+        account_url=dst.get("account_url"),
+        container=dst.get("container"),
+        credential=credential,
+        sas_token=sas,
+    )
+
+    columns, session_columns = load_config(args.columns_yaml)
+
+    root_src = src.get("root_prefix") or ""
+    root_dst = dst.get("root_prefix") or ""
+
+    dr = (src.get("date_range") or {})
+    start_s = dr.get("start")
+    end_s = dr.get("end")
+    if not start_s or not end_s:
+        raise ValueError("Please set source.date_range.start and source.date_range.end in settings.json (YYYY-MM-DD).")
+
+    # Build day worklist and per-day loggers
+    day_pairs: List[Tuple[str, str, DayLoggers]] = []
+    day_logger_map: Dict[str, DayLoggers] = {}
+
+    for d in _iter_dates(start_s, end_s):
+        day = _date_prefix(d)
+        src_prefix = _join_prefix(root_src, day)
+        dst_prefix = _join_prefix(root_dst, day)
+        day_logs = setup_day_loggers(d)  # three per-day loggers
+        day_pairs.append((src_prefix, dst_prefix, day_logs))
+        day_logger_map[src_prefix] = day_logs
+
+    total_limit = args.limit if args.limit and args.limit > 0 else None
+    successes = failures = skipped = 0
+    submitted = 0
+    per_day_counts: Dict[str, Dict[str, int]] = {}
+
+    print(f"Scanning days {start_s} to {end_s} …", flush=True)
+    console_err_counter = {"n": 0}
+
+    with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
+        futures = {}
+
+        for src_prefix, dst_prefix, day_logs in day_pairs:
+            # version-proof listing (no paging kwargs)
+            print(f"Listing {src_prefix} (timeout={args.list_timeout}s) …", flush=True)
+            try:
+                # if user provides list_max_pages, approximate a cap of total items
+                max_items = None
+                if args.list_max_pages and args.list_max_pages > 0:
+                    max_items = args.list_page_size * args.list_max_pages
+
+                blobs = list(
+                    iter_json_blobs_paged(
+                        src_cc,
+                        prefix=src_prefix,
+                        timeout=args.list_timeout,
+                        max_items=max_items,
+                    )
+                )
+                print(f"Found {len(blobs)} files in {src_prefix}", flush=True)
+
+            except Exception as e:
+                jlog(day_logs.error, logging.ERROR, "list_error", day_prefix=src_prefix, error=str(e))
+                print(f"[LIST ERROR] {src_prefix}: {e}", file=sys.stderr, flush=True)
+                continue
+
+            if not blobs:
+                continue
+
+            if total_limit is not None:
+                remaining = total_limit - submitted
+                if remaining <= 0:
+                    break
+                blobs = blobs[:remaining]
+
+            per_day_counts.setdefault(src_prefix, {"processed": 0, "skipped": 0, "error": 0})
+
+            for b in blobs:
+                fut = ex.submit(
+                    process_one,
+                    b,
+                    src_cc,
+                    dst_cc,
+                    columns,
+                    session_columns,
+                    dst_prefix,
+                    day_logs,
+                    args.verbose,
+                    console_err_counter,
+                )
+                futures[fut] = (b, src_prefix)
+            submitted += len(blobs)
+
+        for fut in tqdm(as_completed(futures), total=len(futures), unit="file"):
+            res = fut.result()
+            _, day_prefix = futures[fut]
+            if res is None:
+                skipped += 1
+                per_day_counts[day_prefix]["skipped"] += 1
+            elif isinstance(res, str) and res.startswith("ERROR::"):
+                failures += 1
+                per_day_counts[day_prefix]["error"] += 1
+            else:
+                successes += 1
+                per_day_counts[day_prefix]["processed"] += 1
+
+    # Emit per-day summaries
+    for day_prefix, counts in per_day_counts.items():
+        day_logs = day_logger_map.get(day_prefix) or day_loggers_from_prefix(day_prefix)
+        for logger in (day_logs.processed, day_logs.skipped, day_logs.error):
+            jlog(logger, logging.INFO, "day_summary", day_prefix=day_prefix, **counts)
+
+    print(f"Done. Submitted: {submitted}, Success: {successes}, Skipped: {skipped}, Failed: {failures}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
