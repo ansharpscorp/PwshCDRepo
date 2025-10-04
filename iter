@@ -1,3 +1,6 @@
+from typing import Iterable, Optional
+from azure.storage.blob import ContainerClient
+
 def iter_json_blobs_paged(
     container_client: ContainerClient,
     prefix: Optional[str] = None,
@@ -6,27 +9,36 @@ def iter_json_blobs_paged(
     max_pages: Optional[int] = None,
 ) -> Iterable[str]:
     """
-    Page through blobs safely with a timeout and (optional) page cap.
-    Yields names of *.json blobs under 'prefix'.
-
-    NOTE:
-      - Pass timeout to list_blobs(...)
-      - Pass results_per_page to by_page(...)
+    Version-tolerant blob lister:
+      - Attempts to pass timeout to list_blobs; if unsupported, retries w/o it.
+      - Tries page-size knobs in this order: results_per_page -> max_results -> (none).
+      - Yields only *.json blob names.
     """
-    # timeout is applied at the request level here:
-    pager = container_client.list_blobs(
-        name_starts_with=prefix,
-        timeout=timeout
-    ).by_page(
-        continuation_token=None,
-        results_per_page=page_size
-    )
+    # 1) list_blobs with timeout if supported
+    try:
+        pager = container_client.list_blobs(name_starts_with=prefix, timeout=timeout)
+    except TypeError:
+        pager = container_client.list_blobs(name_starts_with=prefix)
 
-    page_index = 0
-    for page in pager:
-        page_index += 1
+    # 2) by_page with best-available page size param
+    page_iter = None
+    for kw in ({"results_per_page": page_size}, {"max_results": page_size}, {}):
+        try:
+            page_iter = pager.by_page(**kw)
+            break
+        except TypeError:
+            continue
+    if page_iter is None:
+        # Extremely old SDK fallback
+        page_iter = pager.by_page()
+
+    # 3) Iterate pages with optional cap
+    page_idx = 0
+    for page in page_iter:
+        page_idx += 1
         for blob in page:
-            if blob.name.lower().endswith(".json"):
-                yield blob.name
-        if max_pages is not None and page_index >= max_pages:
+            name = getattr(blob, "name", "")
+            if isinstance(name, str) and name.lower().endswith(".json"):
+                yield name
+        if max_pages is not None and page_idx >= max_pages:
             break
