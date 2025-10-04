@@ -1,44 +1,75 @@
+from __future__ import annotations
+import os
 from typing import Iterable, Optional
-from azure.storage.blob import ContainerClient
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
+from azure.core.exceptions import ServiceRequestError, ServiceResponseError
+
+def make_container_client(account_url: str, container: str, credential=None, sas_token: Optional[str] = None) -> ContainerClient:
+    """
+    Creates a container client, preferring connection string if set.
+    Works with SAS token or credential fallback.
+    """
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if conn_str:
+        bsc = BlobServiceClient.from_connection_string(conn_str)
+        return bsc.get_container_client(container)
+    if sas_token:
+        sep = "&" if "?" in account_url else "?"
+        bsc = BlobServiceClient(account_url=f"{account_url}{sep}{sas_token}")
+        return bsc.get_container_client(container)
+    bsc = BlobServiceClient(account_url=account_url, credential=credential)
+    return bsc.get_container_client(container)
+
 
 def iter_json_blobs_paged(
     container_client: ContainerClient,
     prefix: Optional[str] = None,
-    page_size: int = 200,
     timeout: int = 60,
-    max_pages: Optional[int] = None,
+    max_items: Optional[int] = None,
 ) -> Iterable[str]:
     """
-    Version-tolerant blob lister:
-      - Attempts to pass timeout to list_blobs; if unsupported, retries w/o it.
-      - Tries page-size knobs in this order: results_per_page -> max_results -> (none).
+    Version-proof blob lister:
+      - Uses list_blobs() directly (no by_page, works on all SDK versions).
+      - Passes timeout if supported, otherwise retries without.
       - Yields only *.json blob names.
+      - Optional max_items cap to prevent huge enumerations.
     """
-    # 1) list_blobs with timeout if supported
     try:
-        pager = container_client.list_blobs(name_starts_with=prefix, timeout=timeout)
+        iterator = container_client.list_blobs(name_starts_with=prefix, timeout=timeout)
     except TypeError:
-        pager = container_client.list_blobs(name_starts_with=prefix)
+        iterator = container_client.list_blobs(name_starts_with=prefix)
 
-    # 2) by_page with best-available page size param
-    page_iter = None
-    for kw in ({"results_per_page": page_size}, {"max_results": page_size}, {}):
-        try:
-            page_iter = pager.by_page(**kw)
-            break
-        except TypeError:
-            continue
-    if page_iter is None:
-        # Extremely old SDK fallback
-        page_iter = pager.by_page()
+    count = 0
+    for blob in iterator:
+        name = getattr(blob, "name", "")
+        if isinstance(name, str) and name.lower().endswith(".json"):
+            yield name
+            count += 1
+            if max_items is not None and count >= max_items:
+                break
 
-    # 3) Iterate pages with optional cap
-    page_idx = 0
-    for page in page_iter:
-        page_idx += 1
-        for blob in page:
-            name = getattr(blob, "name", "")
-            if isinstance(name, str) and name.lower().endswith(".json"):
-                yield name
-        if max_pages is not None and page_idx >= max_pages:
-            break
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+    retry=retry_if_exception_type((ServiceRequestError, ServiceResponseError)),
+)
+def download_text(container_client: ContainerClient, blob_name: str) -> bytes:
+    """Download blob content with retries."""
+    bc: BlobClient = container_client.get_blob_client(blob_name)
+    downloader = bc.download_blob(max_concurrency=8)
+    return downloader.readall()
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+    retry=retry_if_exception_type((ServiceRequestError, ServiceResponseError)),
+)
+def upload_bytes(container_client: ContainerClient, blob_name: str, data: bytes, overwrite=True) -> None:
+    """Upload blob bytes with retries."""
+    bc: BlobClient = container_client.get_blob_client(blob_name)
+    bc.upload_blob(data, overwrite=overwrite)
