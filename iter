@@ -1,0 +1,32 @@
+def iter_json_blobs_paged(
+    container_client: ContainerClient,
+    prefix: Optional[str] = None,
+    page_size: int = 200,
+    timeout: int = 60,
+    max_pages: Optional[int] = None,
+) -> Iterable[str]:
+    """
+    Page through blobs safely with a timeout and (optional) page cap.
+    Yields names of *.json blobs under 'prefix'.
+
+    NOTE:
+      - Pass timeout to list_blobs(...)
+      - Pass results_per_page to by_page(...)
+    """
+    # timeout is applied at the request level here:
+    pager = container_client.list_blobs(
+        name_starts_with=prefix,
+        timeout=timeout
+    ).by_page(
+        continuation_token=None,
+        results_per_page=page_size
+    )
+
+    page_index = 0
+    for page in pager:
+        page_index += 1
+        for blob in page:
+            if blob.name.lower().endswith(".json"):
+                yield blob.name
+        if max_pages is not None and page_index >= max_pages:
+            break
