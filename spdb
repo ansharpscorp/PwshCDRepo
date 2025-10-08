@@ -1,0 +1,59 @@
+# src/db.py
+import pyodbc
+from azure.identity import ClientSecretCredential
+
+_SQL_COPT_SS_ACCESS_TOKEN = 1256  # SQL Server-specific attribute
+
+def _aad_access_token(tenant_id: str, client_id: str, client_secret: str) -> bytes:
+    """
+    Acquire an Azure AD access token for Azure SQL and return UTF-16-LE bytes
+    WITH a terminating null (some driver builds are picky without it).
+    """
+    scope = "https://database.windows.net/.default"
+    raw = ClientSecretCredential(tenant_id, client_id, client_secret).get_token(scope).token
+    # UTF-16-LE + explicit null terminator for safety
+    return bytes(raw, "utf-16-le") + b"\x00"
+
+def _base_conn_str(server: str, database: str, driver: str, timeout_seconds: int) -> str:
+    # NOTE: Do NOT include Authentication=... when injecting a token via attrs_before.
+    return (
+        f"Driver={driver};"
+        f"Server=tcp:{server},1433;"
+        f"Database={database};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        f"Timeout={timeout_seconds};"
+    )
+
+def connect_odbc(server: str, database: str, driver: str,
+                 tenant_id: str, client_id: str, client_secret: str,
+                 timeout_seconds: int = 0):
+    """
+    1) Try AAD token injection (attrs_before) — most robust.
+    2) Fallback: built-in Service Principal flow (Authentication=ActiveDirectoryServicePrincipal).
+    """
+    pyodbc.pooling = False  # avoid stale pooled handles when debugging
+    base = _base_conn_str(server, database, driver, timeout_seconds)
+
+    # --- Attempt 1: token injection ---
+    try:
+        token = _aad_access_token(tenant_id, client_id, client_secret)
+        conn = pyodbc.connect(base, attrs_before={_SQL_COPT_SS_ACCESS_TOKEN: token})
+        conn.autocommit = True
+        return conn
+    except pyodbc.Error:
+        # Fall through to SPN mode below
+        pass
+
+    # --- Attempt 2: Service Principal auth handled by the driver ---
+    # Works with ODBC Driver 18+ (and most 17.x). If 17 is missing OS deps, you’ll still want to upgrade.
+    spn = (
+        base +
+        f"Authentication=ActiveDirectoryServicePrincipal;"
+        f"Authority=https://login.microsoftonline.com/{tenant_id};"
+        f"Uid={client_id};"
+        f"Pwd={client_secret};"
+    )
+    conn = pyodbc.connect(spn)
+    conn.autocommit = True
+    return conn
