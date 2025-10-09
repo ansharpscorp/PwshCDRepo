@@ -1,0 +1,130 @@
+from datetime import date
+import math, time
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+def ensure_required_columns(select_cols: list[str], date_col: str, conf_col: str) -> list[str]:
+    cols = list(select_cols)
+    if date_col not in cols: cols.append(date_col)
+    if conf_col not in cols: cols.append(conf_col)
+    return cols
+
+def _q(c: str) -> str:
+    # bracket-quote for SQL Server identifiers (handles spaces, keywords)
+    return "[" + c.replace("]", "]]") + "]"
+
+def load_query_text(query_file_path: str) -> str:
+    with open(query_file_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def count_unique_ids_for_day(conn, base_query: str, date_col: str, conf_col: str, the_day: date) -> int:
+    """
+    Declare @p_start/@p_end from positional parameters (?), then use the original base_query
+    which references @p_start/@p_end. Count distinct Conference Id for safety
+    with CONVERT(date, ...) = @p_start.
+    """
+    sql = f"""
+    DECLARE @p_start date = ?;
+    DECLARE @p_end   date = ?;
+    WITH base AS (
+        {base_query}
+    )
+    SELECT COUNT(DISTINCT {_q(conf_col)}) 
+    FROM base
+    WHERE CONVERT(date, {_q(date_col)}) = @p_start;
+    """
+    cur = conn.cursor()
+    cur.execute(sql, (the_day, the_day))
+    row = cur.fetchone()
+    return int(row[0] or 0)
+
+def fetch_batch_df(conn, base_query: str, date_col: str, conf_col: str,
+                   select_cols: list[str], the_day: date, batch_size: int, batch_index: int,
+                   arraysize: int) -> pd.DataFrame:
+    """
+    Slice the day's distinct ConferenceIds into 10k-ID windows using ROW_NUMBER()
+    and join back to pull all rows for those IDs. We reuse @p_start as the 'day' anchor.
+    """
+    start_rn = batch_index * batch_size + 1
+    end_rn   = (batch_index + 1) * batch_size
+    select_list = ", ".join(_q(c) for c in select_cols)
+
+    sql = f"""
+    DECLARE @p_start date = ?;
+    DECLARE @p_end   date = ?;
+
+    WITH base AS (
+        {base_query}
+    ),
+    ids AS (
+        SELECT 
+            CONVERT(date, {_q(date_col)}) AS d,
+            {_q(conf_col)} AS ConferenceId,
+            ROW_NUMBER() OVER (
+                PARTITION BY CONVERT(date, {_q(date_col)})
+                ORDER BY {_q(conf_col)}
+            ) AS rn
+        FROM base
+    )
+    SELECT {select_list}
+    FROM base t
+    JOIN ids 
+      ON ids.d = CONVERT(date, t.{_q(date_col)})
+     AND ids.ConferenceId = t.{_q(conf_col)}
+    WHERE ids.d = @p_start AND ids.rn BETWEEN ? AND ?
+    OPTION (RECOMPILE);
+    """
+
+    params = (the_day, the_day, start_rn, end_rn)  # bind @p_start/@p_end, then rn bounds
+    cur = conn.cursor()
+    cur.arraysize = arraysize
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    return pd.DataFrame.from_records(rows, columns=cols)
+
+def write_parquet(fs, full_path: str, df: pd.DataFrame, compression: str) -> tuple[int, float]:
+    t0 = time.perf_counter()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    with fs.open(full_path, "wb") as f:
+        pq.write_table(table, f, compression=compression)
+    secs = time.perf_counter() - t0
+    try:
+        size = fs.size(full_path)
+    except Exception:
+        size = next((it["size"] for it in fs.ls(full_path, detail=True) if it["name"] == full_path), 0)
+    return int(size), secs
+
+def export_one_day(conn, fs, base_output: str, base_query: str,
+                   date_col: str, conf_col: str, select_cols: list[str],
+                   the_day: date, batch_conf_ids: int, compression: str,
+                   arraysize: int) -> list[dict]:
+    y, m, d = f"{the_day.year:04d}", f"{the_day.month:02d}", f"{the_day.day:02d}"
+    out_dir = f"{base_output}/{y}/{m}/{d}"
+
+    total_ids = count_unique_ids_for_day(conn, base_query, date_col, conf_col, the_day)
+    if total_ids == 0:
+        return []
+
+    batches = math.ceil(total_ids / batch_conf_ids)
+    metrics = []
+
+    for bi in range(batches):
+        df = fetch_batch_df(conn, base_query, date_col, conf_col, select_cols, the_day,
+                            batch_conf_ids, bi, arraysize)
+        if df.empty:
+            continue
+        path = f"{out_dir}/part-{bi+1:05d}.parquet"
+        size, secs = write_parquet(fs, path, df, compression)
+        metrics.append({
+            "date": str(the_day),
+            "batch_index": bi + 1,
+            "ids_rn_start": bi * batch_conf_ids + 1,
+            "ids_rn_end": (bi + 1) * batch_conf_ids,
+            "rows": int(len(df)),
+            "bytes": size,
+            "seconds": round(secs, 3),
+            "path": path
+        })
+    return metrics
