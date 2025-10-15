@@ -35,3 +35,47 @@ def process_day(date_str, cfg):
         print(f"❌ [{date_str}] Error: {e}")
         logger.error(f"❌ [{date_str}] {e}")
         return None, date_str, f"Failed: {e}"
+
+
+-----------------------------------------------
+
+def process_day(date_str, cfg):
+    from processor import enrich_call_data
+    from sqlalchemy import create_engine
+    import pandas as pd
+
+    logger = get_logger()
+    print(f"📄 [{date_str}] Starting day process...")
+
+    try:
+        engine = get_sql_engine(cfg)
+        columns = ", ".join(cfg.get("columns", ["*"]))
+        query = f"""
+        SELECT {columns}
+        FROM {cfg['tables']['call_data']}
+        WHERE CONVERT(date, [{cfg['date_column']}]) = '{pd.to_datetime(date_str).strftime('%Y-%m-%d')}'
+        """
+        print(f"📦 [{date_str}] Loading call data in chunks...")
+        call_df = pd.concat(pd.read_sql(query, engine, chunksize=100000), ignore_index=True)
+        print(f"📦 [{date_str}] Loaded {len(call_df):,} rows.")
+
+        if call_df.empty:
+            return None, date_str, "No data"
+
+        user_df = pd.read_sql(f"SELECT * FROM {cfg['tables']['user_data']}", engine)
+        network_df = pd.read_sql(f"SELECT * FROM {cfg['tables']['network_data']}", engine)
+
+        enriched_parts = []
+        for chunk in np.array_split(call_df, 10):
+            enriched_parts.append(enrich_call_data(chunk, user_df, network_df))
+        enriched = pd.concat(enriched_parts, ignore_index=True)
+        del call_df, user_df, network_df
+
+        print(f"✅ [{date_str}] Processed successfully ({len(enriched)} rows).")
+        return enriched, date_str, "Success"
+
+    except Exception as e:
+        print(f"❌ [{date_str}] Error: {e}")
+        logger.error(f"❌ [{date_str}] {e}")
+        return None, date_str, f"Failed: {e}"
+
