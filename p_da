@@ -1,0 +1,37 @@
+def process_day(date_str, cfg):
+    """Per-day worker — reconnects to DB in each process."""
+    from processor import enrich_call_data
+    from sqlalchemy import create_engine
+    import pandas as pd
+
+    logger = get_logger()
+    print(f"📄 [{date_str}] Starting day process...")
+
+    try:
+        # New engine inside each subprocess (avoids pickle)
+        engine = get_sql_engine(cfg)
+        print(f"🔗 [{date_str}] Connected to SQL inside subprocess.")
+
+        # Read per-day call data only
+        query = f"""
+        SELECT * FROM {cfg['tables']['call_data']}
+        WHERE CONVERT(date, [{cfg['date_column']}]) = '{pd.to_datetime(date_str).strftime('%Y-%m-%d')}'
+        """
+        call_df = pd.read_sql(query, engine)
+        if call_df.empty:
+            print(f"⚠️ [{date_str}] No data found — skipping.")
+            return None, date_str, "No data"
+
+        # Re-read lookup tables inside worker
+        user_df = pd.read_sql(f"SELECT * FROM {cfg['tables']['user_data']}", engine)
+        network_df = pd.read_sql(f"SELECT * FROM {cfg['tables']['network_data']}", engine)
+        print(f"📥 [{date_str}] Lookup tables loaded ({len(user_df)} users, {len(network_df)} subnets).")
+
+        enriched = enrich_call_data(call_df, user_df, network_df)
+        print(f"✅ [{date_str}] Processed successfully ({len(enriched)} rows).")
+        return enriched, date_str, "Success"
+
+    except Exception as e:
+        print(f"❌ [{date_str}] Error: {e}")
+        logger.error(f"❌ [{date_str}] {e}")
+        return None, date_str, f"Failed: {e}"
