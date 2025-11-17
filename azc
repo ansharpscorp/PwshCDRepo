@@ -1,0 +1,9 @@
+az storage blob copy start-batch \
+  --source-account-name <oldStorageAccount> \
+  --source-container <oldcontainer> \
+  --source-string "foldername/YYYY/MM/dd/" \
+  --destination-account-name <newStorageAccount> \
+  --destination-container <newcontainer> \
+  --destination-path "newfolder/YYYY/MM/dd/" \
+  --pattern "*.parquet" \
+  --auth-mode login
