@@ -1,0 +1,49 @@
+from pyspark.sql.functions import input_file_name, regexp_extract, col
+
+# Raw Parquet base (up to "folder")
+raw_base_path = "abfss://<container>@<account>.dfs.core.windows.net/folder"
+
+# Read ALL dates under folder/YYYY/MM/dd/*.parquet
+df_raw = (
+    spark.read
+         .option("mergeSchema", "false")         # set to true only if schemas differ
+         .parquet(f"{raw_base_path}/*/*/*/*.parquet")
+)
+
+# Pattern that matches ".../folder/YYYY/MM/dd/..."
+pattern = r"/folder/(\d{4})/(\d{2})/(\d{2})/"
+
+df = (
+    df_raw
+      .withColumn("file_path", input_file_name())
+      .withColumn("year",  regexp_extract("file_path", pattern, 1).cast("int"))
+      .withColumn("month", regexp_extract("file_path", pattern, 2).cast("int"))
+      .withColumn("day",   regexp_extract("file_path", pattern, 3).cast("int"))
+      .drop("file_path")
+)
+
+df.select("year", "month", "day").dropDuplicates().show()
+
+#Delta Path separate from the raw parquet
+delta_path = "abfss://<container>@<account>.dfs.core.windows.net/delta/teams_calls"
+
+(
+    df
+      .write
+      .format("delta")
+      .mode("overwrite")                 # use "append" for incremental loads
+      .partitionBy("year", "month", "day")
+      .save(delta_path)
+)
+
+
+# To read
+
+df_day = (
+    spark.read
+         .format("delta")
+         .load(delta_path)
+         .where("year = 2025 AND month = 10 AND day = 1")
+)
+
+
