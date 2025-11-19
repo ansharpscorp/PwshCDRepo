@@ -1,0 +1,91 @@
+from datetime import date, timedelta
+from pyspark.sql.functions import lit, col
+from pyspark.sql.utils import AnalysisException
+
+# ======================================================
+# CONFIGURE THESE PATHS (same as before)
+# ======================================================
+raw_base_path = "abfss://<container>@<account>.dfs.core.windows.net/folder"
+delta_path    = "abfss://<container>@<account>.dfs.core.windows.net/delta/teams_cdr"
+
+# Date range you want to add (September 2025)
+start_date = date(2025, 9, 1)
+end_date   = date(2025, 9, 30)
+
+# ======================================================
+# Spark settings (optional but recommended)
+# ======================================================
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+spark.conf.set("spark.sql.parquet.mergeSchema", "false")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "false")
+
+# ======================================================
+# 1) Read existing Delta partitions (year/month/day)
+# ======================================================
+try:
+    df_existing = spark.read.format("delta").load(delta_path)
+    existing_dates = {
+        (int(r["year"]), int(r["month"]), int(r["day"]))
+        for r in df_existing.select("year", "month", "day").dropDuplicates().collect()
+    }
+    print(f"Existing Delta partitions: {len(existing_dates)}")
+except Exception as e:
+    print(f"Delta table not found or unreadable at {delta_path}, treating as empty. {e}")
+    existing_dates = set()
+
+# ======================================================
+# 2) Loop through September days & append only new ones
+# ======================================================
+current = start_date
+
+while current <= end_date:
+    y, m, d = current.year, current.month, current.day
+
+    # Skip if this day already exists in Delta
+    if (y, m, d) in existing_dates:
+        print(f"Skipping {current} (already present in Delta).")
+        current += timedelta(days=1)
+        continue
+
+    day_path = f"{raw_base_path}/{y:04d}/{m:02d}/{d:02d}/*.parquet"
+    print(f"=== Processing new day {current}: {day_path} ===")
+
+    try:
+        df_day_raw = (
+            spark.read
+                 .option("mergeSchema", "false")
+                 .parquet(day_path)
+        )
+    except AnalysisException as e:
+        print(f"No data found for {current}: {e}")
+        current += timedelta(days=1)
+        continue
+
+    # Cast all existing columns (id, type, modalities, startDateTime, endDateTime, session_id, etc.) to STRING
+    for c in df_day_raw.columns:
+        df_day_raw = df_day_raw.withColumn(c, col(c).cast("string"))
+
+    # Add partition columns
+    df_day = (
+        df_day_raw
+        .withColumn("year",  lit(y).cast("int"))
+        .withColumn("month", lit(m).cast("int"))
+        .withColumn("day",   lit(d).cast("int"))
+    )
+
+    # Optional: reduce many small files
+    df_day = df_day.coalesce(64)   # tune this number based on size/cluster
+
+    # Append to existing Delta table
+    (
+        df_day.write
+              .format("delta")
+              .mode("append")
+              .partitionBy("year", "month", "day")
+              .save(delta_path)
+    )
+
+    print(f"Appended Delta partition for {current}")
+    current += timedelta(days=1)
+
+print("=== Completed adding September partitions to Delta table ===")
