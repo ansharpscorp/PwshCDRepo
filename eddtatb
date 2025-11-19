@@ -1,0 +1,5 @@
+spark.sql("""
+CREATE OR REPLACE TABLE main.cqd.teams_cdr
+USING DELTA
+LOCATION 'abfss://<container>@<account>.dfs.core.windows.net/delta/teams_cdr'
+""")
