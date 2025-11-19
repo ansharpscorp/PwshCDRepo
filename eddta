@@ -1,0 +1,83 @@
+from datetime import date, timedelta
+from pyspark.sql.functions import lit, col
+from pyspark.sql.utils import AnalysisException
+
+# ======================================================
+# CONFIGURE THESE PATHS
+# ======================================================
+# Raw Parquet base: folder/YYYY/MM/dd/*.parquet
+raw_base_path = "abfss://<container>@<account>.dfs.core.windows.net/folder"
+
+# Delta output path
+delta_path = "abfss://<container>@<account>.dfs.core.windows.net/delta/teams_cdr"
+
+# Date range to process
+start_date = date(2025, 10, 1)
+end_date   = date(2025, 10, 31)
+
+# ======================================================
+# Recommended Spark Settings
+# ======================================================
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+spark.conf.set("spark.sql.parquet.mergeSchema", "false")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "false")
+
+
+first_write = True
+current = start_date
+
+while current <= end_date:
+    y, m, d = current.year, current.month, current.day
+    day_path = f"{raw_base_path}/{y:04d}/{m:02d}/{d:02d}/*.parquet"
+    print(f"=== Processing {day_path} ===")
+
+    try:
+        # Read one day of parquet
+        df_day_raw = (
+            spark.read
+                 .option("mergeSchema", "false")
+                 .parquet(day_path)
+        )
+    except AnalysisException as e:
+        print(f"No data found for {current}: {e}")
+        current += timedelta(days=1)
+        continue
+
+    # ======================================================
+    # CAST ALL COLUMNS TO STRING (CDR-safe)
+    # ======================================================
+    for c in df_day_raw.columns:
+        df_day_raw = df_day_raw.withColumn(c, col(c).cast("string"))
+
+    # ======================================================
+    # Add partition columns
+    # ======================================================
+    df_day = (
+        df_day_raw
+        .withColumn("year",  lit(y).cast("int"))
+        .withColumn("month", lit(m).cast("int"))
+        .withColumn("day",   lit(d).cast("int"))
+    )
+
+    # Reduce many tiny files → fewer larger Delta files
+    df_day = df_day.coalesce(64)
+
+    # Prepare writer
+    writer = (
+        df_day.write
+             .format("delta")
+             .partitionBy("year", "month", "day")
+    )
+
+    # Write first day (overwrite), then append
+    if first_write:
+        writer.mode("overwrite").save(delta_path)
+        print(f"Created Delta table for first day {current}")
+        first_write = False
+    else:
+        writer.mode("append").save(delta_path)
+        print(f"Appended Delta partition for {current}")
+
+    current += timedelta(days=1)
+
+print("=== COMPLETED BUILDING DELTA TABLE FOR ALL DAYS ===")
