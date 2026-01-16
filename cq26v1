@@ -1,0 +1,257 @@
+CREATE OR REPLACE VIEW gold.v_fact_cqd_user_stream AS
+
+/* =========================================================
+   P2P – Caller (First user) SEND
+   ========================================================= */
+SELECT
+    Date AS DateKey,
+    Conference_Id,
+    Session_Id,
+    Session_Type,
+    Media_Type,
+    Stream_Direction,
+
+    /* Participant */
+    COALESCE(First_UPN, First_Phone_Number) AS Participant_Id,
+    'Caller' AS Participant_Role,
+    First_UserType AS UserType,
+    First_User_Agent_Category AS User_Agent_Category,
+
+    /* Client / Device */
+    First_Client_App_Version AS Client_App_Version,
+    First_Client_Endpoint_Name AS Client_Endpoint_Name,
+    First_Compute_Device_Name AS Compute_Device_Name,
+    First_Compute_Device_Type AS Compute_Device_Type,
+    First_Capture_Dev_Name AS Capture_Dev_Name,
+    First_Render_Dev_Name AS Render_Dev_Name,
+
+    /* Network */
+    First_Network_Connection_Detail AS Network_Connection_Detail,
+    First_Subnet AS Subnet,
+    First_Reflexive_Local_IP_Network AS Reflexive_Local_IP_Network,
+    First_WiFi_Band AS WiFi_Band,
+
+    /* VDI */
+    First_Client_VDI_Mode AS Client_VDI_Mode,
+    First_Client_VDI_Connected_State AS Client_VDI_Connected_State,
+    First_Client_VDI_Is_Optimized AS Client_VDI_Is_Optimized,
+
+    /* Feedback */
+    First_Feedback_Rating_Count AS Feedback_Rating_Count,
+    First_Feedback_Rating_Poor_Count AS Feedback_Rating_Poor_Count,
+    First_Feedback_Token_Audio_Issue_Count AS Feedback_Token_Audio_Issue_Count,
+    First_Feedback_Token_Video_Issue_Count AS Feedback_Token_Video_Issue_Count,
+
+    /* Ownership */
+    TRUE  AS Is_Send_Stream,
+    FALSE AS Is_Receive_Stream,
+
+    /* Stream counts */
+    Total_Stream_Count,
+    Audio_Stream_Count,
+    Audio_Poor_Stream_Count,
+    Video_Stream_Count,
+    Video_Poor_Stream_Count,
+    Video_Poor_Due_to_Freeze_Count,
+    VBSS_Stream_Count,
+    VBSS_Poor_Stream_Count,
+
+    /* Call outcome */
+    Total_Call_Setup_Failed_Stream_Count,
+    Total_CDR_Available_Stream_Count,
+    Total_Call_Dropped_Stream_Count,
+    Total_Call_Setup_Succeeded_Stream_Count,
+    Total_Media_Failed_Stream_Count,
+    Total_Media_Succeeded_Stream_Count,
+
+    Poor_Reason,
+    ClassifiedPoorCall,
+    Classification_Reason,
+    Call_Setup_Failure_Reason,
+    CDR_Response_Reason,
+    PSTN_Call_End_Reason,
+    PSTN_Call_End_Sub_Reason,
+    Is_Call_Queue_Involved,
+    Is_Auto_Attendant_Involved,
+
+    /* Quality */
+    Avg_Jitter,
+    Avg_Jitter_Max,
+    Avg_Packet_Loss_Rate,
+    Avg_Packet_Loss_Rate_Max,
+    Avg_Round_Trip,
+    Avg_Round_Trip_Max,
+
+    /* Network jitter */
+    Avg_Network_Jitter,
+    Avg_Network_Jitter_Min,
+    Avg_Network_Jitter_Max
+
+FROM silver.teams_cqd
+WHERE Session_Type = 'P2P'
+  AND Stream_Direction = 'First-to-Second'
+
+UNION ALL
+
+/* =========================================================
+   P2P – Callee (Second user) SEND
+   ========================================================= */
+SELECT
+    Date,
+    Conference_Id,
+    Session_Id,
+    Session_Type,
+    Media_Type,
+    Stream_Direction,
+
+    COALESCE(Second_UPN, Second_Phone_Number),
+    'Callee',
+    Second_UserType,
+    Second_User_Agent_Category,
+
+    Second_Client_App_Version,
+    Second_Client_Endpoint_Name,
+    Second_Compute_Device_Name,
+    Second_Compute_Device_Type,
+    Second_Capture_Dev_Name,
+    Second_Render_Dev_Name,
+
+    Second_Network_Connection_Detail,
+    Second_Subnet,
+    Second_Reflexive_Local_IP_Network,
+    Second_WiFi_Band,
+
+    Second_Client_VDI_Mode,
+    Second_Client_VDI_Connected_State,
+    Second_Client_VDI_Is_Optimized,
+
+    Second_Feedback_Rating_Count,
+    Second_Feedback_Rating_Poor_Count,
+    Second_Feedback_Token_Audio_Issue_Count,
+    Second_Feedback_Token_Video_Issue_Count,
+
+    TRUE,
+    FALSE,
+
+    Total_Stream_Count,
+    Audio_Stream_Count,
+    Audio_Poor_Stream_Count,
+    Video_Stream_Count,
+    Video_Poor_Stream_Count,
+    Video_Poor_Due_to_Freeze_Count,
+    VBSS_Stream_Count,
+    VBSS_Poor_Stream_Count,
+
+    Total_Call_Setup_Failed_Stream_Count,
+    Total_CDR_Available_Stream_Count,
+    Total_Call_Dropped_Stream_Count,
+    Total_Call_Setup_Succeeded_Stream_Count,
+    Total_Media_Failed_Stream_Count,
+    Total_Media_Succeeded_Stream_Count,
+
+    Poor_Reason,
+    ClassifiedPoorCall,
+    Classification_Reason,
+    Call_Setup_Failure_Reason,
+    CDR_Response_Reason,
+    PSTN_Call_End_Reason,
+    PSTN_Call_End_Sub_Reason,
+    Is_Call_Queue_Involved,
+    Is_Auto_Attendant_Involved,
+
+    Avg_Jitter,
+    Avg_Jitter_Max,
+    Avg_Packet_Loss_Rate,
+    Avg_Packet_Loss_Rate_Max,
+    Avg_Round_Trip,
+    Avg_Round_Trip_Max,
+
+    Avg_Network_Jitter,
+    Avg_Network_Jitter_Min,
+    Avg_Network_Jitter_Max
+
+FROM silver.teams_cqd
+WHERE Session_Type = 'P2P'
+  AND Stream_Direction = 'Second-to-First'
+
+UNION ALL
+
+/* =========================================================
+   Conference – Second user RECEIVE (client experience)
+   ========================================================= */
+SELECT
+    Date,
+    Conference_Id,
+    Session_Id,
+    Session_Type,
+    Media_Type,
+    Stream_Direction,
+
+    COALESCE(Second_UPN, Second_Phone_Number),
+    'Callee',
+    Second_UserType,
+    Second_User_Agent_Category,
+
+    Second_Client_App_Version,
+    Second_Client_Endpoint_Name,
+    Second_Compute_Device_Name,
+    Second_Compute_Device_Type,
+    Second_Capture_Dev_Name,
+    Second_Render_Dev_Name,
+
+    Second_Network_Connection_Detail,
+    Second_Subnet,
+    Second_Reflexive_Local_IP_Network,
+    Second_WiFi_Band,
+
+    Second_Client_VDI_Mode,
+    Second_Client_VDI_Connected_State,
+    Second_Client_VDI_Is_Optimized,
+
+    Second_Feedback_Rating_Count,
+    Second_Feedback_Rating_Poor_Count,
+    Second_Feedback_Token_Audio_Issue_Count,
+    Second_Feedback_Token_Video_Issue_Count,
+
+    FALSE,
+    TRUE,
+
+    Total_Stream_Count,
+    Audio_Stream_Count,
+    Audio_Poor_Stream_Count,
+    Video_Stream_Count,
+    Video_Poor_Stream_Count,
+    Video_Poor_Due_to_Freeze_Count,
+    VBSS_Stream_Count,
+    VBSS_Poor_Stream_Count,
+
+    Total_Call_Setup_Failed_Stream_Count,
+    Total_CDR_Available_Stream_Count,
+    Total_Call_Dropped_Stream_Count,
+    Total_Call_Setup_Succeeded_Stream_Count,
+    Total_Media_Failed_Stream_Count,
+    Total_Media_Succeeded_Stream_Count,
+
+    Poor_Reason,
+    ClassifiedPoorCall,
+    Classification_Reason,
+    Call_Setup_Failure_Reason,
+    CDR_Response_Reason,
+    PSTN_Call_End_Reason,
+    PSTN_Call_End_Sub_Reason,
+    Is_Call_Queue_Involved,
+    Is_Auto_Attendant_Involved,
+
+    Avg_Jitter,
+    Avg_Jitter_Max,
+    Avg_Packet_Loss_Rate,
+    Avg_Packet_Loss_Rate_Max,
+    Avg_Round_Trip,
+    Avg_Round_Trip_Max,
+
+    Avg_Network_Jitter,
+    Avg_Network_Jitter_Min,
+    Avg_Network_Jitter_Max
+
+FROM silver.teams_cqd
+WHERE Session_Type = 'Conf';
