@@ -1,0 +1,202 @@
+CREATE OR REPLACE VIEW gold.v_fact_cqd_user_stream AS
+
+WITH base AS (
+
+    /* =====================================================
+       P2P – Caller (First user) SEND
+       ===================================================== */
+    SELECT
+        Date AS DateKey,
+        Conference_Id,
+        Session_Id,
+        Session_Type,
+        Media_Type,
+        Stream_Direction,
+
+        /* Participant identity */
+        COALESCE(First_UPN, First_Phone_Number) AS Participant_Id,
+        First_Object_Id                         AS Participant_Object_Id,
+        'Caller'                                AS Participant_Role,
+        First_UserType                          AS UserType,
+        First_User_Agent_Category               AS User_Agent_Category,
+
+        /* Client / Device */
+        First_Client_App_Version        AS Client_App_Version,
+        First_Client_Endpoint_Name      AS Client_Endpoint_Name,
+        First_Compute_Device_Name       AS Compute_Device_Name,
+        First_Compute_Device_Type       AS Compute_Device_Type,
+        First_Capture_Dev_Name          AS Capture_Dev_Name,
+        First_Render_Dev_Name           AS Render_Dev_Name,
+
+        /* Network */
+        First_Network_Connection_Detail AS Network_Connection_Detail,
+        First_Subnet                    AS Subnet,
+        First_Reflexive_Local_IP_Network AS Reflexive_IP,
+        First_WiFi_Band                 AS WiFi_Band,
+
+        /* VDI */
+        First_Client_VDI_Mode            AS Client_VDI_Mode,
+        First_Client_VDI_Connected_State AS Client_VDI_Connected_State,
+        First_Client_VDI_Is_Optimized    AS Client_VDI_Is_Optimized,
+
+        /* Ownership */
+        TRUE  AS Is_Send_Stream,
+        FALSE AS Is_Receive_Stream,
+
+        /* Quality */
+        Avg_Jitter,
+        Avg_Packet_Loss_Rate,
+        Avg_Round_Trip
+
+    FROM silver.teams_cqd
+    WHERE Session_Type = 'P2P'
+      AND Stream_Direction = 'First-to-Second'
+
+    UNION ALL
+
+    /* =====================================================
+       P2P – Callee (Second user) SEND
+       ===================================================== */
+    SELECT
+        Date,
+        Conference_Id,
+        Session_Id,
+        Session_Type,
+        Media_Type,
+        Stream_Direction,
+
+        COALESCE(Second_UPN, Second_Phone_Number),
+        Second_Object_Id,
+        'Callee',
+        Second_UserType,
+        Second_User_Agent_Category,
+
+        Second_Client_App_Version,
+        Second_Client_Endpoint_Name,
+        Second_Compute_Device_Name,
+        Second_Compute_Device_Type,
+        Second_Capture_Dev_Name,
+        Second_Render_Dev_Name,
+
+        Second_Network_Connection_Detail,
+        Second_Subnet,
+        Second_Reflexive_Local_IP_Network,
+        Second_WiFi_Band,
+
+        Second_Client_VDI_Mode,
+        Second_Client_VDI_Connected_State,
+        Second_Client_VDI_Is_Optimized,
+
+        TRUE,
+        FALSE,
+
+        Avg_Jitter,
+        Avg_Packet_Loss_Rate,
+        Avg_Round_Trip
+
+    FROM silver.teams_cqd
+    WHERE Session_Type = 'P2P'
+      AND Stream_Direction = 'Second-to-First'
+
+    UNION ALL
+
+    /* =====================================================
+       Conference – Second user RECEIVE (client experience)
+       ===================================================== */
+    SELECT
+        Date,
+        Conference_Id,
+        Session_Id,
+        Session_Type,
+        Media_Type,
+        Stream_Direction,
+
+        COALESCE(Second_UPN, Second_Phone_Number),
+        Second_Object_Id,
+        'Callee',
+        Second_UserType,
+        Second_User_Agent_Category,
+
+        Second_Client_App_Version,
+        Second_Client_Endpoint_Name,
+        Second_Compute_Device_Name,
+        Second_Compute_Device_Type,
+        Second_Capture_Dev_Name,
+        Second_Render_Dev_Name,
+
+        Second_Network_Connection_Detail,
+        Second_Subnet,
+        Second_Reflexive_Local_IP_Network,
+        Second_WiFi_Band,
+
+        Second_Client_VDI_Mode,
+        Second_Client_VDI_Connected_State,
+        Second_Client_VDI_Is_Optimized,
+
+        FALSE,
+        TRUE,
+
+        Avg_Jitter,
+        Avg_Packet_Loss_Rate,
+        Avg_Round_Trip
+
+    FROM silver.teams_cqd
+    WHERE Session_Type = 'Conf'
+)
+
+SELECT
+    b.*,
+
+    /* =========================
+       Org user enrichment
+       ========================= */
+    ou.EmpId        AS Org_EmpId,
+    ou.EmailAddress AS Org_EmailAddress,
+    ou.Country      AS Org_Country,
+    ou.Region       AS Org_Region,
+    ou.Department   AS Org_Department,
+
+    /* =========================
+       Subnet reference
+       ========================= */
+    sr.Country     AS Subnet_Country,
+    sr.Building_Id AS Subnet_Building_Id,
+
+    CASE
+        WHEN sr.Subnet IS NOT NULL THEN 'Inside Network'
+        ELSE 'Outside Network'
+    END AS Subnet_Type,
+
+    /* =========================
+       Reflexive IP reference
+       ========================= */
+    rr.Region  AS Reflexive_IP_Region,
+    rr.Country AS Reflexive_IP_Country,
+
+    CASE
+        WHEN rr.Reflexive_IP IS NOT NULL THEN 'Inside Network'
+        ELSE 'Outside Network'
+    END AS Reflexive_IP_Type,
+
+    /* =========================
+       Severity Score (0–100)
+       ========================= */
+    LEAST(
+        100.0,
+        (
+            0.4 * (COALESCE(b.Avg_Jitter,0) / 30.0) +
+            0.4 * (COALESCE(b.Avg_Packet_Loss_Rate,0) / 5.0) +
+            0.2 * (COALESCE(b.Avg_Round_Trip,0) / 300.0)
+        ) * 100.0
+    ) AS Severity_Score
+
+FROM base b
+
+LEFT JOIN ref.org_user_reference ou
+    ON b.Participant_Object_Id = ou.Object_Id
+
+LEFT JOIN ref.subnet_reference sr
+    ON b.Subnet = sr.Subnet
+
+LEFT JOIN ref.reflexive_ip_reference rr
+    ON b.Reflexive_IP = rr.Reflexive_IP;
